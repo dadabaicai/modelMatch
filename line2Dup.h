@@ -8,10 +8,6 @@
 
 #include "mipp.h"  // for SIMD in different platforms
 
-inline int g_paddingPixel = 0;
-inline int g_imgWidthNoPadding = 0;
-inline int g_imgHeightNoPadding = 0;
-
 namespace line2Dup
 {
 

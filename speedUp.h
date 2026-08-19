@@ -32,6 +32,21 @@ void GaussBlur(unsigned char* Src, unsigned char* Dest, int Width, int Height, i
 
 void GaussBlur_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float Radius);
 
+// Gray (1-channel) recursive Gaussian, same algorithm as GaussBlur_SSE
+void GaussBlurGray_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float Radius);
+
+void GaussBlurGrayFromLeftToRight_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_row, int thread_stride);
+
+void GaussBlurGrayFromRightToLeft_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_row, int thread_stride);
+
+void GaussBlurGrayFromTopToBottom_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_col, int thread_stride);
+
+void GaussBlurGrayFromBottomToTop_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_col, int thread_stride);
+
+void ConvertGray8U2Float_SSE_test(unsigned char* Src, float* Dest, int Width, int Height, int Stride, int DstRowStride, int DstColOffset, int start_row, int thread_stride);
+
+void ConvertFloat2Gray8U_SSE_test(float* Src, unsigned char* Dest, int Width, int Height, int Stride, int extWidth, int start_row, int thread_stride);
+
 void GaussBlurFromLeftToRight_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_row, int thread_stride);
 
 void GaussBlurFromRightToLeft_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_row, int thread_stride);

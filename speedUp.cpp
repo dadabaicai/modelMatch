@@ -99,6 +99,60 @@ void ConvertBGR8U2BGRAF_async(unsigned char* Src, float* Dest, int Width, int He
 	}
 }
 
+static inline unsigned char ClampToByteF(float v)
+{
+	int iv = (int)(v + 0.5f);
+	if (iv < 0) return 0;
+	if (iv > 255) return 255;
+	return (unsigned char)iv;
+}
+
+void ConvertFloat2Gray8U_SSE_test(float* Src, unsigned char* Dest, int Width, int Height, int Stride, int extWidth, int start_row, int thread_stride)
+{
+	const int BlockSize = 4;
+	int Block = Width / BlockSize;
+	const __m128 RoundConst = _mm_set1_ps(0.5f);
+	const __m128i Zero = _mm_setzero_si128();
+
+	for (int Y = start_row; Y < (start_row + thread_stride) && Y < Height; Y++)
+	{
+		float* LinePS = Src + Y * extWidth;
+		unsigned char* LinePD = Dest + Y * Stride;
+		int X = 0;
+		for (; X < Block * BlockSize; X += BlockSize, LinePS += BlockSize, LinePD += BlockSize)
+		{
+			__m128 v = _mm_loadu_ps(LinePS);
+			__m128i i32 = _mm_cvtps_epi32(_mm_add_ps(v, RoundConst));
+			__m128i i16 = _mm_packs_epi32(i32, Zero);
+			__m128i i8 = _mm_packus_epi16(i16, Zero);
+			*(int*)LinePD = _mm_cvtsi128_si32(i8);
+		}
+		for (; X < Width; X++, LinePS++, LinePD++)
+		{
+			*LinePD = ClampToByteF(*LinePS);
+		}
+	}
+}
+
+static void ConvertFloat2Gray8U_async(float* Src, unsigned char* Dest, int Width, int Height, int Stride, int extWidth)
+{
+	const int32_t hw_concur = std::min(100, static_cast<int32_t>(std::thread::hardware_concurrency()));
+	std::vector<std::future<void>> fut(hw_concur);
+	const int thread_stride = (Height - 1) / hw_concur + 1;
+	int i = 0, start = 0;
+	for (; i < std::min(Height, hw_concur); i++, start += thread_stride)
+	{
+		fut[i] = std::async(std::launch::async, [=]() {
+			ConvertFloat2Gray8U_SSE_test(Src, Dest, Width, Height, Stride, extWidth, start, thread_stride);
+			});
+	}
+	for (int j = 0; j < i; ++j)
+	{
+		if (fut[j].valid())
+			fut[j].wait();
+	}
+}
+
 void ConvertBGR8U2BGRAF_SSE(unsigned char* Src, float* Dest, int Width, int Height, int Stride, int DstRowStride, int DstColOffset)
 {
 	const int BlockSize = 4;
@@ -947,4 +1001,193 @@ void GaussBlur_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Heigh
 	ConvertBGRAF2BGR8U_async(Buffer + PAD * extWidth * 4 + PAD * 4, Dest, Width, Height, Stride, extWidth, extHeight);
 
 	_mm_free(Buffer);
+}
+
+static void ConvertGray8U2Float_async(unsigned char* Src, float* Dest, int Width, int Height, int Stride, int DstRowStride, int DstColOffset)
+{
+	const int32_t hw_concur = std::min(100, static_cast<int32_t>(std::thread::hardware_concurrency()));
+	std::vector<std::future<void>> fut(hw_concur);
+	const int thread_stride = (Height - 1) / hw_concur + 1;
+	int i = 0, start = 0;
+	for (; i < std::min(Height, hw_concur); i++, start += thread_stride)
+	{
+		fut[i] = std::async(std::launch::async, [=]() {
+			ConvertGray8U2Float_SSE_test(Src, Dest, Width, Height, Stride, DstRowStride, DstColOffset, start, thread_stride);
+			});
+	}
+	for (int j = 0; j < i; ++j)
+	{
+		if (fut[j].valid())
+			fut[j].wait();
+	}
+}
+
+void GaussBlurGray_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float Radius)
+{
+	const int PAD = (int)(3 * Radius);
+	float B0, B1, B2, B3;
+	CalcGaussCof(Radius, B0, B1, B2, B3);
+	int extWidth = Width + 2 * PAD;
+	int extHeight = Height + 2 * PAD;
+	float* Buffer = (float*)_mm_malloc(extWidth * extHeight * sizeof(float), 16);
+	if (!Buffer)
+		return;
+	ConvertGray8U2Float_async(Src, Buffer + PAD * extWidth, Width, Height, Stride, extWidth, PAD);
+	// replicate left/right borders
+	for (int y = 0; y < extHeight; y++)
+	{
+		float* row = Buffer + y * extWidth;
+		float first = row[PAD];
+		float last = row[PAD + Width - 1];
+		for (int i = 0; i < PAD; i++)
+		{
+			row[i] = first;
+			row[PAD + Width + i] = last;
+		}
+	}
+	// replicate top/bottom borders
+	float* topRow = Buffer + PAD * extWidth;
+	for (int i = 0; i < PAD; i++)
+		memcpy(Buffer + i * extWidth, topRow, extWidth * sizeof(float));
+	float* bottomRow = Buffer + (PAD + Height - 1) * extWidth;
+	for (int i = 0; i < PAD; i++)
+		memcpy(Buffer + (PAD + Height + i) * extWidth, bottomRow, extWidth * sizeof(float));
+	GaussBlur_asyncProcess(Buffer, extWidth, extHeight, B0, B1, B2, B3, extHeight, GaussBlurGrayFromLeftToRight_test);
+	GaussBlur_asyncProcess(Buffer, extWidth, extHeight, B0, B1, B2, B3, extHeight, GaussBlurGrayFromRightToLeft_test);
+	GaussBlur_asyncProcess(Buffer, extWidth, extHeight, B0, B1, B2, B3, extWidth, GaussBlurGrayFromTopToBottom_test);
+	GaussBlur_asyncProcess(Buffer, extWidth, extHeight, B0, B1, B2, B3, extWidth, GaussBlurGrayFromBottomToTop_test);
+	ConvertFloat2Gray8U_async(Buffer + PAD * extWidth + PAD, Dest, Width, Height, Stride, extWidth);
+	_mm_free(Buffer);
+}
+
+void ConvertGray8U2Float_SSE_test(unsigned char* Src, float* Dest, int Width, int Height, int Stride, int DstRowStride, int DstColOffset, int start_row, int thread_stride)
+{
+	const int BlockSize = 4;
+	int Block = Width / BlockSize;
+	const __m128i Zero = _mm_setzero_si128();
+
+	for (int Y = start_row; Y < (start_row + thread_stride) && Y < Height; Y++)
+	{
+		unsigned char* LinePS = Src + Y * Stride;
+		float* LinePD = Dest + Y * DstRowStride + DstColOffset;
+		int X = 0;
+		for (; X < Block * BlockSize; X += BlockSize, LinePS += BlockSize, LinePD += BlockSize)
+		{
+			__m128i src8 = _mm_cvtsi32_si128(*(const int*)LinePS); // 4 uchar
+			__m128i src16 = _mm_unpacklo_epi8(src8, Zero);
+			__m128i src32 = _mm_unpacklo_epi16(src16, Zero);
+			_mm_storeu_ps(LinePD, _mm_cvtepi32_ps(src32));
+		}
+		for (; X < Width; X++, LinePS++, LinePD++)
+		{
+			*LinePD = (float)(*LinePS);
+		}
+	}
+}
+
+void GaussBlurGrayFromLeftToRight_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_row, int thread_stride)
+{
+	// Horizontal IIR is causal along X; process rows independently (scalar per pixel).
+	for (int Y = start_row; Y < (start_row + thread_stride) && Y < Height; Y++)
+	{
+		float* LinePD = Data + Y * Width;
+		float V1 = LinePD[0], V2 = V1, V3 = V1;
+		for (int X = 0; X < Width; X++)
+		{
+			float V0 = LinePD[X];
+			float V = V0 * B0 + V1 * B1 + V2 * B2 + V3 * B3;
+			V3 = V2;
+			V2 = V1;
+			V1 = V;
+			LinePD[X] = V;
+		}
+	}
+}
+
+void GaussBlurGrayFromRightToLeft_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_row, int thread_stride)
+{
+	for (int Y = start_row; Y < (start_row + thread_stride) && Y < Height; Y++)
+	{
+		float* LinePD = Data + Y * Width + (Width - 1);
+		float V1 = *LinePD, V2 = V1, V3 = V1;
+		for (int X = Width - 1; X >= 0; X--, LinePD--)
+		{
+			float V0 = *LinePD;
+			float V = V0 * B0 + V1 * B1 + V2 * B2 + V3 * B3;
+			V3 = V2;
+			V2 = V1;
+			V1 = V;
+			*LinePD = V;
+		}
+	}
+}
+
+void GaussBlurGrayFromTopToBottom_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_col, int thread_stride)
+{
+	const __m128 CofB0 = _mm_set1_ps(B0);
+	const __m128 CofB1 = _mm_set1_ps(B1);
+	const __m128 CofB2 = _mm_set1_ps(B2);
+	const __m128 CofB3 = _mm_set1_ps(B3);
+	const int end_col = std::min(start_col + thread_stride, Width);
+
+	for (int Y = 0; Y < Height - 4; Y++)
+	{
+		int base = (Y + 3) * Width;
+		float* LinePS0 = Data + base;
+		float* LinePS1 = Data + base - Width;
+		float* LinePS2 = Data + base - 2 * Width;
+		float* LinePS3 = Data + base - 3 * Width;
+
+		int X = start_col;
+		for (; X + 4 <= end_col; X += 4)
+		{
+			__m128 V0 = _mm_loadu_ps(LinePS0 + X);
+			__m128 V1 = _mm_loadu_ps(LinePS1 + X);
+			__m128 V2 = _mm_loadu_ps(LinePS2 + X);
+			__m128 V3 = _mm_loadu_ps(LinePS3 + X);
+			__m128 V = _mm_add_ps(
+				_mm_add_ps(_mm_mul_ps(CofB0, V0), _mm_mul_ps(CofB1, V1)),
+				_mm_add_ps(_mm_mul_ps(CofB2, V2), _mm_mul_ps(CofB3, V3)));
+			_mm_storeu_ps(LinePS0 + X, V);
+		}
+		for (; X < end_col; X++)
+		{
+			LinePS0[X] = LinePS0[X] * B0 + LinePS1[X] * B1 + LinePS2[X] * B2 + LinePS3[X] * B3;
+		}
+	}
+}
+
+void GaussBlurGrayFromBottomToTop_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_col, int thread_stride)
+{
+	const __m128 CofB0 = _mm_set1_ps(B0);
+	const __m128 CofB1 = _mm_set1_ps(B1);
+	const __m128 CofB2 = _mm_set1_ps(B2);
+	const __m128 CofB3 = _mm_set1_ps(B3);
+	const int end_col = std::min(start_col + thread_stride, Width);
+
+	for (int Y = Height - 1 - 3; Y >= 0; Y--)
+	{
+		int base = Y * Width;
+		float* LinePS0 = Data + base;
+		float* LinePS1 = Data + base + Width;
+		float* LinePS2 = Data + base + 2 * Width;
+		float* LinePS3 = Data + base + 3 * Width;
+
+		int X = start_col;
+		for (; X + 4 <= end_col; X += 4)
+		{
+			__m128 V0 = _mm_loadu_ps(LinePS0 + X);
+			__m128 V1 = _mm_loadu_ps(LinePS1 + X);
+			__m128 V2 = _mm_loadu_ps(LinePS2 + X);
+			__m128 V3 = _mm_loadu_ps(LinePS3 + X);
+			__m128 V = _mm_add_ps(
+				_mm_add_ps(_mm_mul_ps(CofB0, V0), _mm_mul_ps(CofB1, V1)),
+				_mm_add_ps(_mm_mul_ps(CofB2, V2), _mm_mul_ps(CofB3, V3)));
+			_mm_storeu_ps(LinePS0 + X, V);
+		}
+		for (; X < end_col; X++)
+		{
+			LinePS0[X] = LinePS0[X] * B0 + LinePS1[X] * B1 + LinePS2[X] * B2 + LinePS3[X] * B3;
+		}
+	}
 }

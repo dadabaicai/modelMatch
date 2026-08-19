@@ -1,9 +1,28 @@
 ﻿#include "line2Dup.h"
 #include <iostream>
 #include <future>
+#include <memory>
 #include "speedUp.h"
 #include <pmmintrin.h>
 #include <chrono>
+#include <omp.h>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_BitScanForward)
+
+static inline int ctz_u16(uint16_t mask) {
+	unsigned long index;
+	if (_BitScanForward(&index, (unsigned long)mask)) {
+		return (int)index;
+	}
+	return 0; // 当 mask == 0 时，返回 0（与 __builtin_ctz 未定义行为不同，这里安全）
+}
+#else
+static inline int ctz_u16(uint16_t mask) {
+	return __builtin_ctz((unsigned)mask);
+}
+#endif
 
 using namespace std;
 using namespace cv;
@@ -286,6 +305,147 @@ void hysteresisGradient(Mat &magnitude, Mat &quantized_angle,
     }
 }
 
+void hysteresisGradientSpeedUp(Mat& magnitude, Mat& quantized_angle,
+	Mat& angle, Mat& angleAuant, float threshold)
+{
+	// Quantize 360 degree range of orientations into 16 buckets
+	// Note that [0, 11.25), [348.75, 360) both get mapped in the end to label 0,
+	// for stability of horizontal and vertical features.
+	Mat_<unsigned char> quantized_unfiltered;
+	//angle.convertTo(quantized_unfiltered, CV_8U, 16.0 / 360.0);
+
+	// Zero out top and bottom rows
+	/// @todo is this necessary, or even correct?
+	memset(angleAuant.ptr(), 0, angleAuant.cols);
+	memset(angleAuant.ptr(angleAuant.rows - 1), 0, angleAuant.cols);
+	// Zero out first and last columns
+	for (int r = 0; r < angleAuant.rows; ++r)
+	{
+        angleAuant.ptr<uchar>(r)[0] = 0;
+        angleAuant.ptr<uchar>(r)[angleAuant.cols - 1] = 0;
+	}
+
+	//// Mask 16 buckets into 8 quantized orientations
+	//for (int r = 1; r < angle.rows - 1; ++r)
+	//{
+	//	uchar* quant_r = angleAuant.ptr<uchar>(r);
+	//	for (int c = 1; c < angle.cols - 1; ++c)
+	//	{
+	//		quant_r[c] &= 7;
+	//	}
+	//}
+
+	//// Filter the raw quantized image. Only accept pixels where the magnitude is above some
+	//// threshold, and there is local agreement on the quantization.
+	//quantized_angle = Mat::zeros(angle.size(), CV_8U);
+	//for (int r = 1; r < angle.rows - 1; ++r)
+	//{
+	//	float* mag_r = magnitude.ptr<float>(r);
+
+	//	for (int c = 1; c < angle.cols - 1; ++c)
+	//	{
+	//		if (mag_r[c] > threshold)
+	//		{
+	//			// Compute histogram of quantized bins in 3x3 patch around pixel
+	//			int histogram[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+ //               
+	//			uchar* patch3x3_row = &angleAuant.ptr<uchar>(r - 1)[c - 1];
+	//			histogram[patch3x3_row[0]]++;
+	//			histogram[patch3x3_row[1]]++;
+	//			histogram[patch3x3_row[2]]++;
+
+	//			patch3x3_row += angleAuant.step1();
+	//			histogram[patch3x3_row[0]]++;
+	//			histogram[patch3x3_row[1]]++;
+	//			histogram[patch3x3_row[2]]++;
+
+	//			patch3x3_row += angleAuant.step1();
+	//			histogram[patch3x3_row[0]]++;
+	//			histogram[patch3x3_row[1]]++;
+	//			histogram[patch3x3_row[2]]++;
+
+	//			// Find bin with the most votes from the patch
+	//			int max_votes = 0;
+	//			int index = -1;
+	//			for (int i = 0; i < 8; ++i)
+	//			{
+	//				if (max_votes < histogram[i])
+	//				{
+	//					index = i;
+	//					max_votes = histogram[i];
+	//				}
+	//			}
+
+	//			// Only accept the quantization if majority of pixels in the patch agree
+	//			static const int NEIGHBOR_THRESHOLD = 5;
+	//			if (max_votes >= NEIGHBOR_THRESHOLD)
+	//				quantized_angle.at<uchar>(r, c) = uchar(1 << index);
+	//		}
+	//	}
+	//}
+	quantized_angle = Mat::zeros(angle.size(), CV_8U);
+
+	const int rows = angle.rows;
+	const int cols = angle.cols;
+	const int step = (int)angleAuant.step1(); // 字节步长
+
+#pragma omp parallel for schedule(dynamic)
+	for (int r = 1; r < rows - 1; ++r) 
+    {
+		uchar* q_row0 = angleAuant.ptr<uchar>(r - 1);
+		uchar* q_row1 = angleAuant.ptr<uchar>(r);
+		uchar* q_row2 = angleAuant.ptr<uchar>(r + 1);
+		float* mag_row = magnitude.ptr<float>(r);
+		uchar* out_row = quantized_angle.ptr<uchar>(r);
+
+		// 初始化直方图（9个值）
+		int h[8] = { 0 };
+		auto add_pixel = [&](int rr, int cc) { int v = angleAuant.ptr<uchar>(rr)[cc]; ++h[v]; };
+		for (int cc = 0; cc < 3; ++cc) 
+        { 
+            add_pixel(r - 1, cc); 
+            add_pixel(r, cc); 
+            add_pixel(r + 1, cc); 
+        }
+
+		// 滑动窗口
+		for (int c = 1; c < cols - 1; ++c) 
+        {
+			// 当前窗口中心为 (r,c)，直方图 h 对应列 [c-1, c+1]
+			if (mag_row[c] > threshold) 
+            {
+				// 找最大值（展开比较）
+				int max_votes = h[0], idx = 0;
+				for (int i = 1; i < 8; ++i) 
+                {
+                    if (h[i] > max_votes) 
+                    { 
+                        max_votes = h[i]; idx = i; 
+                    }
+                }
+				if (max_votes >= 5) out_row[c] = (uchar)(1 << idx);
+			}
+
+			// 滑动窗口：移除左侧列 (c-1)，加入右侧列 (c+2)
+			if (c - 1 >= 0) 
+            {
+				int left = c - 1; // 其实 c-1 是即将被移除的列，但我们现在窗口是 [c-1, c+1]，下一步窗口是 [c, c+2]
+				// 移除列 c-1（如果是第一次，c=1，移除列0）
+				--h[q_row0[left]];
+				--h[q_row1[left]];
+				--h[q_row2[left]];
+			}
+			int right = c + 2;
+			if (right < cols) 
+            {
+				++h[q_row0[right]];
+				++h[q_row1[right]];
+				++h[q_row2[right]];
+			}
+		}
+	}
+}
+
 // 将 16 个 int16_t 转换为 2组 8 个 float(32位)
 static void int16_to_float_16x16(__m256i data,__m256& out1, __m256& out2) 
 {
@@ -342,12 +502,13 @@ static inline __m256i compute_square_sum_32bit(__m256i gx16, __m256i gy16)
 
 void _Sobel(unsigned char* Src, const int32_t Width, const int32_t Height, const int32_t start_row, const int32_t thread_stride, const int32_t Stride, 
     unsigned char* Dest, unsigned char** thread_local_buffers, float* sobelResMat_C3_32F_Speed, const int32_t Stride2, const int Channel, const int BlockSize, const int Block,
-    float* sobleAngle_C3_32F_Speed, const int32_t Stride3, short* sobel_3dx_Speed, int Stride4, short* sobel_3dy_Speed, int Stride5)
+    float* sobleAngle_C3_32F_Speed, const int32_t Stride3, short* sobel_3dx_Speed, int Stride4, short* sobel_3dy_Speed, int Stride5, 
+    float* sobel_3dx_Float_Speed, int Stride6, float* sobel_3dy_Float_Speed, int Stride7)
 {
 	unsigned char* First = thread_local_buffers[0];
 	unsigned char* Second = thread_local_buffers[1];
 	unsigned char* Third = thread_local_buffers[2];
-	for (int Y = start_row; Y < start_row + thread_stride; Y++) 
+	for (int Y = start_row; Y < start_row + thread_stride && Y < Height; Y++) 
     {
 		unsigned char* LinePS = Src + Y * Stride;
 		unsigned char* LinePD = Dest + Y * Stride;
@@ -355,6 +516,8 @@ void _Sobel(unsigned char* Src, const int32_t Width, const int32_t Height, const
         float* LinePD_AngleSpeed = sobleAngle_C3_32F_Speed + Y * Stride3;
         short* sobel_dx_SpeedPtr = sobel_3dx_Speed + Y * Stride4;
         short* sobel_dy_SpeedPtr = sobel_3dy_Speed + Y * Stride5;
+        float* sobel_dx_Float_SpeedPtr = sobel_3dx_Float_Speed + Y * Stride6;
+        float* sobel_dy_Float_SpeedPtr = sobel_3dy_Float_Speed + Y * Stride7;
 		if (Y != start_row)
         {
 			unsigned char* Temp = First;
@@ -374,12 +537,89 @@ void _Sobel(unsigned char* Src, const int32_t Width, const int32_t Height, const
 		}
 		if (Channel == 1) 
         {
-			for (int X = 0; X < Width; X++)
+			__m256i Zero = _mm256_setzero_si256();
+			for (int X = 0; X < Block * BlockSize; X += BlockSize)
 			{
-				float GX = First[X] - First[X + 2] + (Second[X] - Second[X + 2]) * 2 + Third[X] - Third[X + 2];
-                float GY = First[X] + First[X + 2] + (First[X + 1] - Third[X + 1]) * 2 - Third[X] - Third[X + 2];
-				//LinePD[X] = Table[min(GX * GX + GY * GY, 65025)];
-                LinePD[X] = sqrtf(GX * GX + GY * GY + 0.0F);
+				// 单通道：邻域偏移为 1/2（对应三通道的 3/6）
+				__m256i FirstP0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(First + X)));
+				__m256i FirstP1 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(First + X + 1)));
+				__m256i FirstP2 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(First + X + 2)));
+
+				__m256i SecondP0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(Second + X)));
+				__m256i SecondP2 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(Second + X + 2)));
+
+				__m256i ThirdP0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(Third + X)));
+				__m256i ThirdP1 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(Third + X + 1)));
+				__m256i ThirdP2 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(Third + X + 2)));
+
+				// |GX|, |GY| —— 与三通道路径一致，便于幅值计算
+				__m256i GX16 = _mm256_abs_epi16(_mm256_adds_epi16(_mm256_adds_epi16(_mm256_subs_epi16(FirstP2, FirstP0), _mm256_slli_epi16(_mm256_subs_epi16(SecondP2, SecondP0), 1)), _mm256_subs_epi16(ThirdP2, ThirdP0)));
+				__m256i GY16 = _mm256_abs_epi16(_mm256_subs_epi16(_mm256_adds_epi16(_mm256_adds_epi16(ThirdP0, ThirdP2), _mm256_slli_epi16(_mm256_subs_epi16(ThirdP1, FirstP1), 1)), _mm256_adds_epi16(FirstP0, FirstP2)));
+
+				__m256i GXYL = _mm256_unpacklo_epi16(GX16, GY16);
+				__m256i GXYH = _mm256_unpackhi_epi16(GX16, GY16);
+
+				__m256 squareSum_Low = _mm256_cvtepi32_ps(_mm256_madd_epi16(GXYL, GXYL));
+				__m256 squareSum_Height = _mm256_cvtepi32_ps(_mm256_madd_epi16(GXYH, GXYH));
+
+				__m256i ResultL = _mm256_cvtps_epi32(_mm256_sqrt_ps(squareSum_Low));
+				__m256i ResultH = _mm256_cvtps_epi32(_mm256_sqrt_ps(squareSum_Height));
+				__m256i Result = _mm256_packus_epi16(_mm256_packus_epi32(ResultL, ResultH), Zero);
+
+				__m128i Ans1 = _mm256_castsi256_si128(Result);
+				_mm_storel_epi64((__m128i*)(LinePD + X), Ans1);
+				__m128i Ans2 = _mm256_extracti128_si256(Result, 1);
+				_mm_storel_epi64((__m128i*)(LinePD + X + 8), Ans2);
+
+				// 按像素顺序写回 GX^2+GY^2（修正 AVX 128-bit lane 交错）
+				__m128 low_low_128 = _mm256_castps256_ps128(squareSum_Low);
+				__m128 low_high_128 = _mm256_extractf128_ps(squareSum_Low, 1);
+				__m128 high_low_128 = _mm256_castps256_ps128(squareSum_Height);
+				__m128 high_high_128 = _mm256_extractf128_ps(squareSum_Height, 1);
+				__m256 part1 = _mm256_set_m128(high_low_128, low_low_128);
+				__m256 part2 = _mm256_set_m128(high_high_128, low_high_128);
+				_mm256_storeu_ps(LinePD_FloatTest + X, part1);
+				_mm256_storeu_ps(LinePD_FloatTest + X + 8, part2);
+
+				// 有符号梯度（与 OpenCV Sobel / 三通道路径一致）
+				__m256i GX16_N0_abs = _mm256_adds_epi16(_mm256_adds_epi16(_mm256_subs_epi16(FirstP2, FirstP0), _mm256_slli_epi16(_mm256_subs_epi16(SecondP2, SecondP0), 1)), _mm256_subs_epi16(ThirdP2, ThirdP0));
+				__m256i GY16_N0_abs = _mm256_subs_epi16(_mm256_adds_epi16(_mm256_adds_epi16(ThirdP0, ThirdP2), _mm256_slli_epi16(_mm256_subs_epi16(ThirdP1, FirstP1), 1)), _mm256_adds_epi16(FirstP0, FirstP2));
+				_mm256_storeu_si256((__m256i*)(sobel_dx_SpeedPtr + X), GX16_N0_abs);
+				_mm256_storeu_si256((__m256i*)(sobel_dy_SpeedPtr + X), GY16_N0_abs);
+
+                // ***增加float类型的输出
+				// 提取低8个 int16
+				__m128i gx_low_i16 = _mm256_castsi256_si128(GX16_N0_abs);
+				__m128i gx_high_i16 = _mm256_extracti128_si256(GX16_N0_abs, 1);
+				__m128i gy_low_i16 = _mm256_castsi256_si128(GY16_N0_abs);
+				__m128i gy_high_i16 = _mm256_extracti128_si256(GY16_N0_abs, 1);
+				// 扩展为 int32
+				__m256i gx_low_i32 = _mm256_cvtepi16_epi32(gx_low_i16);
+				__m256i gx_high_i32 = _mm256_cvtepi16_epi32(gx_high_i16);
+				__m256i gy_low_i32 = _mm256_cvtepi16_epi32(gy_low_i16);
+				__m256i gy_high_i32 = _mm256_cvtepi16_epi32(gy_high_i16);
+				// 转换为 float
+				__m256 gx_low_ps = _mm256_cvtepi32_ps(gx_low_i32);
+				__m256 gx_high_ps = _mm256_cvtepi32_ps(gx_high_i32);
+				__m256 gy_low_ps = _mm256_cvtepi32_ps(gy_low_i32);
+				__m256 gy_high_ps = _mm256_cvtepi32_ps(gy_high_i32);
+				// 存储
+				_mm256_storeu_ps(sobel_dx_Float_SpeedPtr + X, gx_low_ps);
+				_mm256_storeu_ps(sobel_dx_Float_SpeedPtr + X + 8, gx_high_ps);
+				_mm256_storeu_ps(sobel_dy_Float_SpeedPtr + X, gy_low_ps);
+				_mm256_storeu_ps(sobel_dy_Float_SpeedPtr + X + 8, gy_high_ps);
+			}
+
+			for (int X = Block * BlockSize; X < Width; X++)
+			{
+				int GX = First[X + 2] - First[X] + (Second[X + 2] - Second[X]) * 2 + Third[X + 2] - Third[X];
+				int GY = Third[X] + Third[X + 2] + (Third[X + 1] - First[X + 1]) * 2 - First[X] - First[X + 2];
+				LinePD[X] = IM_ClampToByte((int)(sqrtf(GX * GX + GY * GY + 0.0F) + 0.5f));
+				LinePD_FloatTest[X] = (float)(GX * GX + GY * GY);
+				sobel_dx_SpeedPtr[X] = (short)GX;
+				sobel_dy_SpeedPtr[X] = (short)GY;
+                sobel_dx_Float_SpeedPtr[X] = (float)GX;
+                sobel_dy_Float_SpeedPtr[X] = (float)GY;
 			}
 		}
 		else
@@ -505,7 +745,8 @@ void _Sobel(unsigned char* Src, const int32_t Width, const int32_t Height, const
 }
 
 void Sobel_AVX2(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float* sobelResMat_C3_32F_Speed, int Stride2,
-    float* sobleAngle_C3_32F_Speed, int Stride3, short* sobel_3dx_Speed, int Stride4, short* sobel_3dy_Speed, int Stride5)
+    float* sobleAngle_C3_32F_Speed, int Stride3, short* sobel_3dx_Speed, int Stride4, short* sobel_3dy_Speed, int Stride5, 
+    float* sobel_3dx_Float_Speed, int Stride6, float* sobel_3dy_Float_Speed, int Stride7)
 {
 	//INIT
 	int Channel = Stride / Width;
@@ -515,7 +756,7 @@ void Sobel_AVX2(unsigned char* Src, unsigned char* Dest, int Width, int Height, 
 	//Run                                         
 	// Height >> 4,右移4位，相当于除以 16（2^4 = 16）,含义：图像高度分成多少个16像素高度的块. 为什么是16？因为，高度优化：16像素块大小通常是SIMD优化的友好单位（如SSE/AVX）
 	//std::thread::hardware_concurrency()--返回系统真正支持的硬件并发线程数（CPU核心数或超线程数）,例如：4核8线程的CPU → 返回 8
-    const int32_t hw_concur = std::min(100/*Height >> 4*/, static_cast<int32_t>(std::thread::hardware_concurrency()));
+    const int32_t hw_concur = std::min(Height >> 4, static_cast<int32_t>(std::thread::hardware_concurrency()));
 
 	std::vector<std::future<void>> fut(hw_concur);
     std::vector<unsigned char*> allocated_buffers;
@@ -595,7 +836,8 @@ void Sobel_AVX2(unsigned char* Src, unsigned char* Dest, int Width, int Height, 
 		// 传递堆上分配的数组，每个线程独立
 		fut[i] = std::async(std::launch::async, [=]() {
 			_Sobel(Src, Width, Height, start, thread_stride, Stride, Dest,
-				thread_buffers, sobelResMat_C3_32F_Speed, Stride2, Channel, BlockSize, Block, sobleAngle_C3_32F_Speed, Stride3, sobel_3dx_Speed, Stride4, sobel_3dy_Speed, Stride5);
+				thread_buffers, sobelResMat_C3_32F_Speed, Stride2, Channel, BlockSize, Block, sobleAngle_C3_32F_Speed, Stride3, sobel_3dx_Speed, Stride4, sobel_3dy_Speed, Stride5, 
+                sobel_3dx_Float_Speed, Stride6, sobel_3dy_Float_Speed, Stride7);
 			delete[] thread_buffers;  // 线程结束后释放
             });
 	}
@@ -613,7 +855,7 @@ void Sobel_AVX2(unsigned char* Src, unsigned char* Dest, int Width, int Height, 
 	}
 }
 
-void _phase(float* SrcX, float* SrcY, float* DestAngle, const int32_t Width, const int32_t Height, const int32_t start_row, const int32_t thread_stride,
+void _phase(float* SrcX, float* SrcY, float* DestAngle, unsigned char* DestAngleQuant, const int32_t Width, const int32_t Height, const int32_t start_row, const int32_t thread_stride,
     const int32_t Stride, const int Channel, const int BlockSize, const int Block, bool angleInDegrees = false)
 {
 	const float RAD_TO_DEG = 180.0f / 3.14159265358979323846f;
@@ -645,8 +887,33 @@ void _phase(float* SrcX, float* SrcY, float* DestAngle, const int32_t Width, con
 				__m256 mask = _mm256_cmp_ps(out_atan2, zero_vec, _CMP_LT_OQ);  // 小于0的掩码
 				__m256 add_360 = _mm256_and_ps(mask, three_sixty_vec);          // 只对负数加360
 				out_atan2 = _mm256_add_ps(out_atan2, add_360);
-
                 _mm256_storeu_ps(LinePD + X, out_atan2);
+
+				// 量化, 乘 16/360
+				const __m256 scale = _mm256_set1_ps(16.0f / 360.0f);
+				const __m256 round_half = _mm256_set1_ps(0.0f);
+				const __m256i zero_i = _mm256_setzero_si256();
+			    // 对 out_atan2 量化
+				__m256 scaled = _mm256_mul_ps(out_atan2, scale);
+				// 四舍五入: 加 0.5 后截断
+				__m256 rounded = _mm256_add_ps(scaled, round_half);
+				// 转为 32 位整数
+				__m256i int32 = _mm256_cvtps_epi32(rounded);
+				// 限制到 0~15（按位与 15，因为 16 -> 0）
+				__m256i mask2 = _mm256_set1_epi32(15);
+				int32 = _mm256_and_si256(int32, mask2);
+				// 提取低 128 位（前 4 个 int32）和高 128 位（后 4 个 int32）
+				__m128i lo32 = _mm256_castsi256_si128(int32);
+				__m128i hi32 = _mm256_extracti128_si256(int32, 1);
+				// 打包为 8 个 int16 (低半部分 lo32, 高半部分 hi32)
+				__m128i int16 = _mm_packus_epi32(lo32, hi32);   // 注意：这是 SSE2 指令，返回 8 个 uint16_t
+				// 压缩为 8 个 uint8_t (取 int16 的低 8 位)
+				__m128i uint8 = _mm_packus_epi16(int16, _mm_setzero_si128());
+                // 映射到 0~7
+				__m128i mask7 = _mm_set1_epi8(7);
+				__m128i uint8_7 = _mm_and_si128(uint8, mask7);
+				// 存储到目标地址 (uchar 类型)
+				_mm_storeu_si128((__m128i*)(DestAngleQuant + Y * Stride + X), uint8_7);
 			}
 		}
         else
@@ -670,7 +937,7 @@ void _phase(float* SrcX, float* SrcY, float* DestAngle, const int32_t Width, con
     }
 }
 
-void phaseSelf(float* SrcX, float* SrcY, float* DestAngle, const int32_t Width, const int32_t Height, const int32_t Stride, bool angleInDegrees = false)
+void phaseSelf(float* SrcX, float* SrcY, float* DestAngle, unsigned char* DestAngleQuant, const int32_t Width, const int32_t Height, const int32_t Stride, bool angleInDegrees = false)
 {
 	//INIT
 	int Channel = Stride / Width;
@@ -680,7 +947,7 @@ void phaseSelf(float* SrcX, float* SrcY, float* DestAngle, const int32_t Width, 
 	//Run                                         
 	// Height >> 4,右移4位，相当于除以 16（2^4 = 16）,含义：图像高度分成多少个16像素高度的块. 为什么是16？因为，高度优化：16像素块大小通常是SIMD优化的友好单位（如SSE/AVX）
 	//std::thread::hardware_concurrency()--返回系统真正支持的硬件并发线程数（CPU核心数或超线程数）,例如：4核8线程的CPU → 返回 8
-	const int32_t hw_concur = std::min(100/*Height >> 4*/, static_cast<int32_t>(std::thread::hardware_concurrency()));
+	const int32_t hw_concur = std::min(Height >> 4, static_cast<int32_t>(std::thread::hardware_concurrency()));
 
 	std::vector<std::future<void>> fut(hw_concur);
 	std::vector<unsigned char*> allocated_buffers;
@@ -691,7 +958,7 @@ void phaseSelf(float* SrcX, float* SrcY, float* DestAngle, const int32_t Width, 
     for (; i < std::min(Height, hw_concur); i++, start += thread_stride)
     {
 		fut[i] = std::async(std::launch::async, [=]() {
-            _phase(SrcX, SrcY, DestAngle, Width, Height, start, thread_stride, Stride, Channel, BlockSize, Block, angleInDegrees);
+            _phase(SrcX, SrcY, DestAngle, DestAngleQuant, Width, Height, start, thread_stride, Stride, Channel, BlockSize, Block, angleInDegrees);
 			});
     }
 }
@@ -699,45 +966,59 @@ void phaseSelf(float* SrcX, float* SrcY, float* DestAngle, const int32_t Width, 
 static void quantizedOrientations(const Mat &src, Mat &magnitude,
                                   Mat &angle, Mat& angle_ori, float threshold)
 {
-    Mat smoothed = src.clone();
+    Mat smoothed;
     // Compute horizontal and vertical image derivatives on all color channels separately
     static const int SIGMA = 1;
     // For some reason cvSmooth/cv::GaussianBlur, cvSobel/cv::Sobel have different defaults for border handling...
     //GaussianBlur(src, smoothed, Size(SIGMA * 8 + 1, SIGMA * 8 + 1), SIGMA, 0, BORDER_REPLICATE);
     // 先把Padding区域去除,纯黑区域且当SIGM=1时,耗时会大大增加
-    cv::Rect roiRect(g_paddingPixel, g_paddingPixel, g_imgWidthNoPadding, g_imgHeightNoPadding);
-    cv::Mat roiImg = src(roiRect).clone();
-	int Height = roiImg.rows;
-	int Width = roiImg.cols;
-	unsigned char* roiImgPtr = roiImg.data;
-	unsigned char* Dest = new unsigned char[Height * Width * 3];
-    int Stride = Width * 3;
-    GaussBlur_SSE(roiImgPtr, Dest, Width, Height, Stride, SIGMA);
-    Mat dst(Height, Width, CV_8UC3, Dest);
-    dst.copyTo(smoothed(roiRect));
+	// GaussBlur_SSE 仅支持 3 通道；单通道走 GaussBlurGray_SSE
+	std::unique_ptr<unsigned char[]> Dest;
+    std::unique_ptr<unsigned char[]> DestChannel3;
+	int Height = src.rows;
+	int Width = src.cols;
+    int Stride = Width * src.channels();
+	if (src.channels() == 1)
+	{
+		Dest.reset(new unsigned char[Height * Width]);
+		GaussBlurGray_SSE(src.data, Dest.get(), Width, Height, Stride, SIGMA);
+		smoothed = Mat(Height, Width, CV_8UC1, Dest.get());
+	}
+	else
+	{
+        DestChannel3.reset(new unsigned char[Height * Width * 3]);
+		GaussBlur_SSE(src.data, DestChannel3.get(), Width, Height, Stride, SIGMA);
+    	smoothed = Mat(Height, Width, CV_8UC3, DestChannel3.get());
+	}
 
     if(src.channels() == 1)
     {
-        Mat sobel_dx, sobel_dy, sobel_ag;
-        Sobel(smoothed, sobel_dx, CV_32F, 1, 0, 3, 1.0, 0.0, BORDER_REPLICATE);
-        Sobel(smoothed, sobel_dy, CV_32F, 0, 1, 3, 1.0, 0.0, BORDER_REPLICATE);
-        magnitude = sobel_dx.mul(sobel_dx) + sobel_dy.mul(sobel_dy);
-        phase(sobel_dx, sobel_dy, sobel_ag, true);
-        hysteresisGradient(magnitude, angle, sobel_ag, threshold * threshold);
-        angle_ori = sobel_ag;
+        //Mat sobel_dx, sobel_dy, sobel_ag;
+        //Sobel(smoothed, sobel_dx, CV_32F, 1, 0, 3, 1.0, 0.0, BORDER_REPLICATE);
+        //Sobel(smoothed, sobel_dy, CV_32F, 0, 1, 3, 1.0, 0.0, BORDER_REPLICATE);
+        //magnitude = sobel_dx.mul(sobel_dx) + sobel_dy.mul(sobel_dy);
+        //phase(sobel_dx, sobel_dy, sobel_ag, true);
+        //hysteresisGradient(magnitude, angle, sobel_ag, threshold * threshold);
+        //angle_ori = sobel_ag;
 
-		Mat ptr_SobelResMat_C1_8U_Speed = Mat::zeros(smoothed.size(), CV_8U);
+		Mat SobelResMat_C1_8U_Speed = Mat::zeros(smoothed.size(), CV_8U);
         Mat sobelResMat_C1_32F_Speed = Mat::zeros(smoothed.size(), CV_32F);
 		Mat sobleAngle_C1_32F_Speed = cv::Mat::zeros(smoothed.size(), CV_32F);
+		Mat sobleAngleQuant_C1_8U_Speed = cv::Mat::zeros(smoothed.size(), CV_8U);
 		Mat sobel_1dx_Speed = Mat::zeros(smoothed.size(), CV_16S);
 		Mat sobel_1dy_Speed = Mat::zeros(smoothed.size(), CV_16S);
-		Sobel_AVX2(smoothed.ptr(), ptr_SobelResMat_C1_8U_Speed.ptr(), smoothed.cols, smoothed.rows, smoothed.step1(), 
+        Mat sobel_1dx_Float_Speed = Mat::zeros(smoothed.size(), CV_32F);
+        Mat sobel_1dy_Float_Speed = Mat::zeros(smoothed.size(), CV_32F);
+		Sobel_AVX2(smoothed.ptr(), SobelResMat_C1_8U_Speed.ptr(), smoothed.cols, smoothed.rows, smoothed.step1(), 
             sobelResMat_C1_32F_Speed.ptr<float>(), sobelResMat_C1_32F_Speed.step1(), sobleAngle_C1_32F_Speed.ptr<float>(), sobleAngle_C1_32F_Speed.step1(),
-            sobel_1dx_Speed.ptr<short>(), sobel_1dx_Speed.step1(), sobel_1dy_Speed.ptr<short>(), sobel_1dx_Speed.step1());
+            sobel_1dx_Speed.ptr<short>(), sobel_1dx_Speed.step1(), sobel_1dy_Speed.ptr<short>(), sobel_1dy_Speed.step1(), 
+            sobel_1dx_Float_Speed.ptr<float>(), sobel_1dx_Float_Speed.step1(), sobel_1dy_Float_Speed.ptr<float>(), sobel_1dy_Float_Speed.step1());
 
-		// 转换为浮点用于对比
-		Mat sobel_dx_Test_F;
-        ptr_SobelResMat_C1_8U_Speed.convertTo(sobel_dx_Test_F, CV_32F);
+		magnitude = sobelResMat_C1_32F_Speed;
+		phaseSelf(sobel_1dx_Float_Speed.ptr<float>(), sobel_1dy_Float_Speed.ptr<float>(), sobleAngle_C1_32F_Speed.ptr<float>(),
+			sobleAngleQuant_C1_8U_Speed.ptr<uchar>(), smoothed.cols, smoothed.rows, sobel_1dx_Float_Speed.step1(), true);
+		hysteresisGradientSpeedUp(sobelResMat_C1_32F_Speed, angle, sobleAngle_C1_32F_Speed, sobleAngleQuant_C1_8U_Speed, threshold * threshold);
+        angle_ori = sobleAngle_C1_32F_Speed;
     }
     else
     {
@@ -758,15 +1039,18 @@ static void quantizedOrientations(const Mat &src, Mat &magnitude,
 		/*******************************************************************/
 
 		Mat sobelResMat_C3_8U_Speed = Mat::zeros(smoothed.size(), CV_8UC3);
-        Mat sobelResMat_C3_32F_Speed = Mat::zeros(smoothed.size(), CV_32FC3);
-        Mat sobleAngle_C3_32F_Speed = cv::Mat::zeros(smoothed.size(), CV_32FC3);
-        Mat sobel_3dx_Speed = Mat::zeros(smoothed.size(), CV_16SC3);
-        Mat sobel_3dy_Speed = Mat::zeros(smoothed.size(), CV_16SC3);
+		Mat sobelResMat_C3_32F_Speed = Mat::zeros(smoothed.size(), CV_32FC3);
+		Mat sobleAngle_C3_32F_Speed = cv::Mat::zeros(smoothed.size(), CV_32FC3);
+		Mat sobel_3dx_Speed = Mat::zeros(smoothed.size(), CV_16SC3);
+		Mat sobel_3dy_Speed = Mat::zeros(smoothed.size(), CV_16SC3);
+        Mat sobel_3dx_Float_Speed = Mat::zeros(smoothed.size(), CV_32FC3);
+        Mat sobel_3dy_Float_Speed = Mat::zeros(smoothed.size(), CV_32FC3);
 		//step1(i):每一维元素的通道数,函数默认参数是0,即: step1() == step1(0)
 		//step[i]:每一维元素的大小，单位字节
 		Sobel_AVX2(smoothed.ptr(), sobelResMat_C3_8U_Speed.ptr(), smoothed.cols, smoothed.rows, smoothed.step1(), 
             sobelResMat_C3_32F_Speed.ptr<float>(), sobelResMat_C3_32F_Speed.step1(), sobleAngle_C3_32F_Speed.ptr<float>(), sobleAngle_C3_32F_Speed.step1(),
-            sobel_3dx_Speed.ptr<short>(), sobel_3dx_Speed.step1(), sobel_3dy_Speed.ptr<short>(), sobel_3dy_Speed.step1());
+            sobel_3dx_Speed.ptr<short>(), sobel_3dx_Speed.step1(), sobel_3dy_Speed.ptr<short>(), sobel_3dy_Speed.step1(), 
+            sobel_3dx_Float_Speed.ptr<float>(), sobel_3dx_Float_Speed.step1(), sobel_3dy_Float_Speed.ptr<float>(), sobel_3dy_Float_Speed.step1());
 
         Mat SobelResMat_Magnitude_Max(size, CV_32F); // maximum horizontal derivative
         Mat magnitude_Test = Mat::zeros(src.size(), CV_32F);
@@ -833,9 +1117,9 @@ static void quantizedOrientations(const Mat &src, Mat &magnitude,
             ptr_sobel_dx_Max += length_sobel_dx_Max;
             ptr_sobel_dy_Max += length_sobel_dy_Max;
 		}
-
         Mat sobleAngle_C1_32F_Speed = cv::Mat::zeros(smoothed.size(), CV_32F);
-        phaseSelf(sobel_dx_Max.ptr<float>(), sobel_dy_Max.ptr<float>(), sobleAngle_C1_32F_Speed.ptr<float>(), smoothed.cols, smoothed.rows, sobel_dx_Max.step1(), true);
+        Mat sobleAngleQuant_C1_8U_Speed = cv::Mat::zeros(smoothed.size(), CV_8U);
+        phaseSelf(sobel_dx_Max.ptr<float>(), sobel_dy_Max.ptr<float>(), sobleAngle_C1_32F_Speed.ptr<float>(), sobleAngleQuant_C1_8U_Speed.ptr<uchar>(), smoothed.cols, smoothed.rows, sobel_dx_Max.step1(), true);
 
         /*******************************************************************/
 
@@ -894,8 +1178,9 @@ static void quantizedOrientations(const Mat &src, Mat &magnitude,
         //phase(sobel_dx, sobel_dy, sobel_ag, true);
         //hysteresisGradient(magnitude, angle, sobel_ag, threshold * threshold);
         //angle_ori = sobel_ag;
-        magnitude = magnitude_Test.clone();
-        hysteresisGradient(magnitude_Test, angle, sobleAngle_C1_32F_Speed, threshold* threshold);
+        magnitude = magnitude_Test;
+        //hysteresisGradient(magnitude_Test, angle, sobleAngle_C1_32F_Speed, threshold* threshold);
+        hysteresisGradientSpeedUp(magnitude_Test, angle, sobleAngle_C1_32F_Speed, sobleAngleQuant_C1_8U_Speed, threshold* threshold);
         angle_ori = sobleAngle_C1_32F_Speed;
     }
 }
@@ -936,9 +1221,7 @@ void ColorGradientPyramid::pyrDown()
         resize(mask, next_mask, size, 0.0, 0.0, INTER_NEAREST);
         mask = next_mask;
     }
-    g_paddingPixel /= 2;
-    g_imgWidthNoPadding /= 2;
-    g_imgHeightNoPadding /= 2;
+
     update();
 }
 
@@ -1941,6 +2224,10 @@ std::vector<Match> Detector::match(Mat source, float threshold,
             computeResponseMaps(spread_quantized, response_maps);
 
             LinearMemories &memories = lm_level[i];
+            //获取最大线程数
+			int num_threads = omp_get_max_threads();
+			if (num_threads <= 0) num_threads = 1;
+            #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
             for (int j = 0; j < 8; ++j)
                 linearize(response_maps[j], memories[j], T);
                 //linearize_mipp(response_maps[j], memories[j], T);
@@ -1993,16 +2280,31 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
                           const std::string &class_id,
                           const std::vector<TemplatePyramid> &template_pyramids) const
 {
-#pragma omp declare reduction \
-    (omp_insert: std::vector<Match>: omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()))
+	//int max_threads = omp_get_max_threads();
+    //int num_procs = omp_get_num_procs();
+    //printf("OpenMP: max_threads=%d, num_procs=%d\n", max_threads, num_procs);
+//#pragma omp declare reduction \
+//    (omp_insert: std::vector<Match>: omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()))
+//
+//#pragma omp parallel for reduction(omp_insert:matches)
+	int num_threads = omp_get_max_threads();
+	if (num_threads <= 0) 
+        num_threads = 1;
 
-#pragma omp parallel for reduction(omp_insert:matches)
-    for (size_t template_id = 0; template_id < template_pyramids.size(); ++template_id)
+    //每个线程一个局部匹配容器
+	std::vector<std::vector<Match>> thread_local_matches(num_threads);
+
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
+    for (long long template_id = 0; template_id < template_pyramids.size(); ++template_id)
     {
-        const TemplatePyramid &tp = template_pyramids[template_id];
+        int tid = omp_get_thread_num(); // 获取当前线程 ID
+        std::vector<Match>& local_vec = thread_local_matches[tid];
+
+        const TemplatePyramid& tp = template_pyramids[template_id];
+
         // First match over the whole image at the lowest pyramid level
         /// @todo Factor this out into separate function
-        const std::vector<LinearMemories> &lowest_lm = lm_pyramid.back();
+        const std::vector<LinearMemories>& lowest_lm = lm_pyramid.back();
 
         std::vector<Match> candidates;
         {
@@ -2013,15 +2315,17 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
             int num_features = 0;
 
             {
-                const Template &templ = tp[lowest_start];
+                const Template& templ = tp[lowest_start];
                 num_features += static_cast<int>(templ.features.size());
 
-                if (templ.features.size() < 64){
+                if (templ.features.size() < 64) {
                     similarity_64(lowest_lm[0], templ, similarities, sizes.back(), lowest_T);
                     similarities.convertTo(similarities, CV_16U);
-                }else if (templ.features.size() < 8192){
+                }
+                else if (templ.features.size() < 8192) {
                     similarity(lowest_lm[0], templ, similarities, sizes.back(), lowest_T);
-                }else{
+                }
+                else {
                     CV_Error(Error::StsBadArg, "feature size too large");
                 }
             }
@@ -2029,7 +2333,7 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
             // Find initial matches
             for (int r = 0; r < similarities.rows; ++r)
             {
-                ushort *row = similarities.ptr<ushort>(r);
+                ushort* row = similarities.ptr<ushort>(r);
                 for (int c = 0; c < similarities.cols; ++c)
                 {
                     int raw_score = row[c];
@@ -2044,13 +2348,54 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
                     }
                 }
             }
+            /*const int offset = lowest_T / 2 + (lowest_T % 2 - 1);
+            const int T = lowest_T;
+            int threshold_scaled = (int)(threshold * 4 * num_features / 100.0 + 0.5);
+            const __m256i v_threshold = _mm256_set1_epi16((short)threshold_scaled);
+            for (int r = 0; r < similarities.rows; ++r)
+            {
+                const uint16_t* row = similarities.ptr<uint16_t>(r);
+                int c = 0;
+                const int cols = similarities.cols;
+                for (; c <= cols - 16; c += 16)
+                {
+                    __m256i v_raw = _mm256_loadu_si256((__m256i*)(row + c));
+
+                    __m256i v_cmp = _mm256_cmpgt_epi16(v_raw, v_threshold);
+
+                    int mask32 = _mm256_movemask_epi8(v_cmp);
+                    uint16_t mask = mask32 & 0xFFFF;
+
+                    while (mask)
+                    {
+                        int bit = ctz_u16(mask);
+                        int idx = c + bit;
+                        int x = idx * T + offset;
+                        int y = r * T + offset;
+                        float score = (row[idx] * 100.f) / (4 * num_features);
+                        candidates.emplace_back(Match(x, y, score, class_id, static_cast<int>(template_id)));
+                        mask &= mask - 1;
+                    }
+                }
+                for (; c < cols; ++c)
+                {
+                    int raw_score = row[c];
+                    if (raw_score > threshold_scaled)
+                    {
+                        int x = c * T + offset;
+                        int y = r * T + offset;
+                        float score = (raw_score * 100.f) / (4 * num_features);
+                        candidates.emplace_back(x, y, score, class_id, template_id);
+                    }
+                }
+            }*/
         }
 
 
         // Locally refine each match by marching up the pyramid
         for (int l = pyramid_levels - 2; l >= 0; --l)
         {
-            const std::vector<LinearMemories> &lms = lm_pyramid[l];
+            const std::vector<LinearMemories>& lms = lm_pyramid[l];
             int T = T_at_level[l];
             int start = static_cast<int>(l);
             Size size = sizes[l];
@@ -2062,7 +2407,7 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
             Mat similarities2;
             for (int m = 0; m < (int)candidates.size(); ++m)
             {
-                Match &match2 = candidates[m];
+                Match& match2 = candidates[m];
                 int x = match2.x * 2 + 1; /// @todo Support other pyramid distance
                 int y = match2.y * 2 + 1;
 
@@ -2078,15 +2423,17 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
                 int numFeatures = 0;
 
                 {
-                    const Template &templ = tp[start];
+                    const Template& templ = tp[start];
                     numFeatures += static_cast<int>(templ.features.size());
 
-                    if (templ.features.size() < 64){
+                    if (templ.features.size() < 64) {
                         similarityLocal_64(lms[0], templ, similarities2, size, T, Point(x, y));
                         similarities2.convertTo(similarities2, CV_16U);
-                    }else if (templ.features.size() < 8192){
+                    }
+                    else if (templ.features.size() < 8192) {
                         similarityLocal(lms[0], templ, similarities2, size, T, Point(x, y));
-                    }else{
+                    }
+                    else {
                         CV_Error(Error::StsBadArg, "feature size too large");
                     }
                 }
@@ -2096,7 +2443,7 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
                 int best_r = -1, best_c = -1;
                 for (int r = 0; r < similarities2.rows; ++r)
                 {
-                    ushort *row = similarities2.ptr<ushort>(r);
+                    ushort* row = similarities2.ptr<ushort>(r);
                     for (int c = 0; c < similarities2.cols; ++c)
                     {
                         int score_int = row[c];
@@ -2118,12 +2465,35 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
 
             // Filter out any matches that drop below the similarity threshold
             std::vector<Match>::iterator new_end = std::remove_if(candidates.begin(), candidates.end(),
-                                                                  MatchPredicate(threshold));
+                MatchPredicate(threshold));
             candidates.erase(new_end, candidates.end());
         }
 
-        matches.insert(matches.end(), candidates.begin(), candidates.end());
+        //matches.insert(matches.end(), candidates.begin(), candidates.end());
+        //将候选移动到线程局部容器(避免复制)
+        if (!candidates.empty())
+        {
+            local_vec.insert(local_vec.end(),
+                std::make_move_iterator(candidates.begin()),
+                std::make_move_iterator(candidates.end()));
+        }
     }
+    //合并所有线程的结果到外部matches
+	matches.clear();
+	size_t total = 0;
+	for (const auto& vec : thread_local_matches) 
+        total += vec.size();
+	matches.reserve(total); //预分配提升性能
+
+	for (auto& vec : thread_local_matches)
+	{
+		if (!vec.empty())
+		{
+			matches.insert(matches.end(),
+				std::make_move_iterator(vec.begin()),
+				std::make_move_iterator(vec.end()));
+		}
+	}
 }
 
 int Detector::addTemplate(const Mat source, const std::string &class_id,

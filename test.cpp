@@ -15,20 +15,21 @@ static std::string prefix = "E:/cwn/ProjectTest/shapeMatch/shape_based_matching-
 class Timer
 {
 public:
-    Timer() : beg_(clock_::now()) {}
-    void reset() { beg_ = clock_::now(); }
-    double elapsed() const {
-        return std::chrono::duration_cast<second_>
-            (clock_::now() - beg_).count(); }
-    void out(std::string message = ""){
-        double t = elapsed();
-        std::cout << message << "\nelasped time:" << t << "s" << std::endl;
-        reset();
-    }
+	Timer() : beg_(clock_::now()) {}
+	void reset() { beg_ = clock_::now(); }
+	double elapsed() const {
+		return std::chrono::duration_cast<second_>
+			(clock_::now() - beg_).count();
+	}
+	void out(std::string message = "") {
+		double t = elapsed();
+		std::cout << message << "\nelasped time:" << t << "s" << std::endl;
+		reset();
+	}
 private:
-    typedef std::chrono::high_resolution_clock clock_;
-    typedef std::chrono::duration<double, std::ratio<1> > second_;
-    std::chrono::time_point<clock_> beg_;
+	typedef std::chrono::high_resolution_clock clock_;
+	typedef std::chrono::duration<double, std::ratio<1> > second_;
+	std::chrono::time_point<clock_> beg_;
 };
 // NMS, got from cv::dnn so we don't need opencv contrib
 // just collapse it
@@ -225,10 +226,10 @@ void scale_test(string mode = "test"){
 }
 
 void angle_test(string mode = "test", bool use_rot = true){
-    line2Dup::Detector detector(128, {4, 8});
+    line2Dup::Detector detector(64, {4, 8});
 
     if(mode != "test"){
-        Mat img = imread(prefix+"case1/train.png", IMREAD_UNCHANGED);
+        Mat img = imread(prefix+"case1/train.png", IMREAD_GRAYSCALE);
         assert(!img.empty() && "check your img path");
 
 		//Rect roi(130, 110, 270, 270);
@@ -245,11 +246,10 @@ void angle_test(string mode = "test", bool use_rot = true){
         mask.copyTo(padded_mask(Rect(padding, padding, img.cols, img.rows)));
 
         shape_based_matching::shapeInfo_producer shapes(padded_img, padded_mask);
-        shapes.angle_range = {-1, 1};
+        shapes.angle_range = {-10, 10};
         shapes.angle_step = 0.1;
 
-        shapes.scale_range = {0.9, 1.1}; // support just one
-        shapes.scale_step = 0.5;
+        shapes.scale_range = {1}; // support just one
         shapes.produce_infos();
         std::vector<shape_based_matching::shapeInfo_producer::Info> infos_have_templ;
         string class_id = "test";
@@ -261,30 +261,30 @@ void angle_test(string mode = "test", bool use_rot = true){
 
         int first_id = 0;
         float first_angle = 0;
-        for(auto& info: shapes.infos){
+        for(auto& info: shapes.infos)
+        {
             Mat to_show = shapes.src_of(info);
 
             std::cout << "\ninfo.angle: " << info.angle << std::endl;
             int templ_id;
 
-			g_paddingPixel = 0;
-			g_imgWidthNoPadding = shapes.src_of(info).cols;
-			g_imgHeightNoPadding = shapes.src_of(info).rows;
-
-            if(is_first){
+            if(is_first)
+            {
                 templ_id = detector.addTemplate(shapes.src_of(info), class_id, shapes.mask_of(info));
                 first_id = templ_id;
                 first_angle = info.angle;
 
                 if(use_rot) is_first = false;
-            }else{
+            }else
+            {
                 templ_id = detector.addTemplate_rotate(class_id, first_id,
                                                        info.angle-first_angle,
                                                 {shapes.src.cols/2.0f, shapes.src.rows/2.0f});
             }
 
             auto templ = detector.getTemplates("test", templ_id);
-            for(int i=0; i<templ[0].features.size(); i++){
+            for(int i=0; i<templ[0].features.size(); i++)
+            {
                 auto feat = templ[0].features[i];
                 cv::circle(to_show, {feat.x+templ[0].tl_x, feat.y+templ[0].tl_y}, 3, {0, 0, 255}, -1);
             }
@@ -309,32 +309,30 @@ void angle_test(string mode = "test", bool use_rot = true){
         // angle & scale are saved here, fetched by match id
         auto infos = shape_based_matching::shapeInfo_producer::load_infos(prefix + "case1/test_info.yaml");
 
-        Mat test_img = imread(prefix+"case1/train.png");
+        Mat test_img = imread(prefix+"case1/train.png", IMREAD_GRAYSCALE);
         assert(!test_img.empty() && "check your img path");
 
-        int padding = 250;
-        cv::Mat padded_img = cv::Mat(test_img.rows + 2*padding,
-                                     test_img.cols + 2*padding, test_img.type(), cv::Scalar::all(0));
-        test_img.copyTo(padded_img(Rect(padding, padding, test_img.cols, test_img.rows)));
+        //int padding = 250;
+        //cv::Mat padded_img = cv::Mat(test_img.rows + 2*padding,
+        //                             test_img.cols + 2*padding, test_img.type(), cv::Scalar::all(0));
+        //test_img.copyTo(padded_img(Rect(padding, padding, test_img.cols, test_img.rows)));
 
-        int stride = 16;
-        int n = padded_img.rows/stride;
-        int m = padded_img.cols/stride;
-        Rect roi(0, 0, stride*m , stride*n);
-        Mat img = padded_img(roi).clone();
+        //int stride = 16;
+        //int n = padded_img.rows/stride;
+        //int m = padded_img.cols/stride;
+        //Rect roi(0, 0, stride*m , stride*n);
+        //Mat img = padded_img(roi).clone();
+        Mat img = test_img;
         assert(img.isContinuous());
 
 //        cvtColor(img, img, CV_BGR2GRAY);
 
-        std::cout << "test img size: " << img.rows * img.cols << std::endl << std::endl;
+        std::cout << "test img size: " << img.rows * img.cols << " (" << img.cols << "x" << img.rows << ")" << std::endl << std::endl;
 
 		// 获取当前时间的时间戳（自epoch以来的毫秒数）
         auto start = std::chrono::high_resolution_clock::now();
 
         Timer timer;
-        g_paddingPixel = padding;
-        g_imgWidthNoPadding = test_img.cols;
-        g_imgHeightNoPadding = test_img.rows;
         auto matches = detector.match(img, 90, ids);
         timer.out("match end");
 		
@@ -538,7 +536,7 @@ void print_ps(__m128 v, const char* name) {
 
 int main()
 {
-	// scale_test("test");
+	//scale_test("test");
 	angle_test("test", true); // test or train
 	// noise_test("test");
 	return 0;
