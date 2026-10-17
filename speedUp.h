@@ -34,6 +34,7 @@ void GaussBlur_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Heigh
 
 // Gray (1-channel) recursive Gaussian, same algorithm as GaussBlur_SSE
 void GaussBlurGray_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float Radius);
+void GaussBlurGray_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float Radius, float* WorkspaceBuffer);
 
 void GaussBlurGrayFromLeftToRight_test(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int start_row, int thread_stride);
 

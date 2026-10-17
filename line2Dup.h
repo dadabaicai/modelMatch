@@ -5,6 +5,7 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/types_c.h>
 #include <map>
+#include <mutex>
 
 #include "mipp.h"  // for SIMD in different platforms
 
@@ -42,9 +43,28 @@ struct Template
 class ColorGradientPyramid
 {
 public:
+    struct ProcessingWorkspace
+    {
+        cv::Mat pyramid_src;
+        cv::Mat pyramid_mask;
+        cv::Mat smoothed;
+        cv::Mat magnitude;
+        cv::Mat angle;
+        cv::Mat angle_ori;
+        cv::Mat angle_quant;
+        cv::Mat sobel_dx_float;
+        cv::Mat sobel_dy_float;
+        cv::Mat gauss_float_buffer;
+        cv::Mat sobel_row_buffers;
+    };
+
     ColorGradientPyramid(const cv::Mat &src, const cv::Mat &mask,
                                              float weak_threshold, size_t num_features,
-                                             float strong_threshold);
+                                             float strong_threshold, bool match_only = false);
+
+    void reset(const cv::Mat &src, const cv::Mat &mask,
+               float weak_threshold, size_t num_features,
+               float strong_threshold, bool match_only);
 
     void quantize(cv::Mat &dst) const;
 
@@ -80,6 +100,8 @@ public:
     float weak_threshold;
     size_t num_features;
     float strong_threshold;
+    bool match_only;
+    std::vector<ProcessingWorkspace> workspaces;
 
     int m_paddingPixel;
     int m_imgWeightNoPadding;
@@ -104,9 +126,15 @@ public:
     void read(const cv::FileNode &fn);
     void write(cv::FileStorage &fs) const;
 
-    cv::Ptr<ColorGradientPyramid> process(const cv::Mat src, const cv::Mat &mask = cv::Mat()) const
+    cv::Ptr<ColorGradientPyramid> process(const cv::Mat &src, const cv::Mat &mask = cv::Mat()) const
     {
         return cv::makePtr<ColorGradientPyramid>(src, mask, weak_threshold, num_features, strong_threshold);
+    }
+
+    cv::Ptr<ColorGradientPyramid> processForMatch(const cv::Mat &src, const cv::Mat &mask = cv::Mat()) const
+    {
+        return cv::makePtr<ColorGradientPyramid>(
+            src, mask, weak_threshold, num_features, strong_threshold, true);
     }
 };
 
@@ -191,6 +219,9 @@ public:
 
 protected:
     cv::Ptr<ColorGradient> modality;
+    // Reused across match() calls and protected by match_mutex.
+    mutable cv::Ptr<ColorGradientPyramid> match_quantizer;
+    mutable std::mutex match_mutex;
     int pyramid_levels;
     std::vector<int> T_at_level;
 
@@ -201,6 +232,10 @@ protected:
     typedef std::vector<cv::Mat> LinearMemories;
     // Indexed as [pyramid level][ColorGradient][quantized label]
     typedef std::vector<std::vector<LinearMemories>> LinearMemoryPyramid;
+    mutable LinearMemoryPyramid match_lm_pyramid;
+    mutable std::vector<cv::Size> match_sizes;
+    mutable std::vector<cv::Mat> match_spread_quantized;
+    mutable std::vector<std::vector<cv::Mat>> match_response_maps;
 
     void matchClass(const LinearMemoryPyramid &lm_pyramid,
                                     const std::vector<cv::Size> &sizes,

@@ -134,12 +134,17 @@ void scale_test(string mode = "test"){
 
 //    mode = "test";
     if(mode == "train"){
-        Mat img = cv::imread(prefix+"case0/templ/circle.png");
+        //Mat img = cv::imread(prefix+"case0/templ/circle.png");
+		Mat img = imread(prefix + "case1/train.png");
+		Rect roi(2505, 1428, 520, 520);
+		img = img(roi).clone();
         assert(!img.empty() && "check your img path");
         shape_based_matching::shapeInfo_producer shapes(img);
 
         shapes.scale_range = {0.1f, 1};
         shapes.scale_step = 0.01f;
+        shapes.angle_range = {-2, 2};
+        shapes.angle_step = 1;
         shapes.produce_infos();
 
         std::vector<shape_based_matching::shapeInfo_producer::Info> infos_have_templ;
@@ -173,7 +178,8 @@ void scale_test(string mode = "test"){
         ids.push_back("circle");
         detector.readClasses(ids, prefix+"case0/%s_templ.yaml");
 
-        Mat test_img = imread(prefix+"case0/1.jpg");
+        //Mat test_img = imread(prefix+"case0/1.jpg");
+        Mat test_img = imread(prefix + "case1/abc.png", IMREAD_GRAYSCALE);
         assert(!test_img.empty() && "check your img path");
 
         // make the img having 32*n width & height
@@ -197,8 +203,10 @@ void scale_test(string mode = "test"){
 
         std::cout << "matches.size(): " << matches.size() << std::endl;
         size_t top5 = 5;
-        if(top5>matches.size()) top5=matches.size();
-        for(size_t i=0; i<top5; i++){
+        if(top5 > matches.size()) 
+            top5 = matches.size();
+        for(size_t i = 0; i < top5; i++)
+        {
             auto match = matches[i];
             auto templ = detector.getTemplates("circle",
                                                match.template_id);
@@ -218,6 +226,7 @@ void scale_test(string mode = "test"){
             cv::circle(img, {x, y}, r, color, 2);
         }
 
+		cv::namedWindow("img", WINDOW_NORMAL);
         imshow("img", img);
         waitKey(0);
 
@@ -229,7 +238,7 @@ void angle_test(string mode = "test", bool use_rot = true){
     line2Dup::Detector detector(64, {4, 8});
 
     if(mode != "test"){
-        Mat img = imread(prefix+"case1/train.png", IMREAD_GRAYSCALE);
+        Mat img = imread(prefix+"case1/train.png");
         assert(!img.empty() && "check your img path");
 
 		//Rect roi(130, 110, 270, 270);
@@ -366,8 +375,6 @@ void angle_test(string mode = "test", bool use_rot = true){
             // center x,y of train_img in test img
             float x =  match.x - templ[0].tl_x + train_img_half_width;
             float y =  match.y - templ[0].tl_y + train_img_half_height;
-
-
 
             cv::Vec3b randColor;
             randColor[0] = rand()%155 + 100;
@@ -536,9 +543,9 @@ void print_ps(__m128 v, const char* name) {
 
 int main()
 {
-	//scale_test("test");
-	angle_test("test", true); // test or train
-	// noise_test("test");
+    //scale_test("test");
+    angle_test("test", true); // test or train
+	//noise_test("test");
 	return 0;
 
 

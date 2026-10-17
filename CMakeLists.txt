@@ -7,22 +7,24 @@ project(shape_based_matching)
 SET(CMAKE_BUILD_TYPE "Release")
 
 
-# arm or x86
-IF(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86")
-    SET(PLATFORM_COMPILE_FLAGS "-mfpu=neon")
-ELSE()
-    SET(PLATFORM_COMPILE_FLAGS "-march=native")
+if(MSVC)
+    # Enable the fused AVX2 response-map path and OpenMP row parallelism.
+    add_compile_options(/EHsc /utf-8 /arch:AVX2)
+else()
+    # arm or x86
+    if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86")
+        set(PLATFORM_COMPILE_FLAGS "-mfpu=neon")
+    else()
+        set(PLATFORM_COMPILE_FLAGS "-march=native")
+    endif()
 
-    # some places of the algorithm are designed for 128 SIMD
-    # so 128 SSE may slightly faster than 256 AVX, you may want this
-#    SET(PLATFORM_COMPILE_FLAGS "-msse -msse2 -msse3 -msse4 -mssse3")  # SSE only
-ENDIF()
+    set(COMMON_COMPILE_FLAGS "-Wall -Wno-sign-compare")
+    set(CMAKE_CXX_FLAGS "${PLATFORM_COMPILE_FLAGS} ${COMMON_COMPILE_FLAGS} $ENV{CXXFLAGS}")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g2 -ggdb")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+endif()
 
-# SET(PLATFORM_COMPILE_FLAGS "-DMIPP_NO_INTRINSICS")  # close SIMD
-SET(COMMON_COMPILE_FLAGS "-fopenmp -Wall -Wno-sign-compare")
-SET(CMAKE_CXX_FLAGS "${PLATFORM_COMPILE_FLAGS} ${COMMON_COMPILE_FLAGS} $ENV{CXXFLAGS}")
-SET(CMAKE_CXX_FLAGS_DEBUG "-O0 -g2 -ggdb")
-SET(CMAKE_CXX_FLAGS_RELEASE "-O3")
+find_package(OpenMP REQUIRED)
 
 
 # opencv
@@ -36,6 +38,6 @@ include_directories (${INCLUDE_DIRECTORIES} "${CMAKE_CURRENT_SOURCE_DIR}/MIPP/")
 
 
 # test exe
-add_executable(${PROJECT_NAME}_test line2Dup.cpp test.cpp)
-target_link_libraries(${PROJECT_NAME}_test ${OpenCV_LIBS})
+add_executable(${PROJECT_NAME}_test line2Dup.cpp speedUp.cpp test.cpp)
+target_link_libraries(${PROJECT_NAME}_test ${OpenCV_LIBS} OpenMP::OpenMP_CXX)
 

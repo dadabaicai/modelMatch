@@ -2,6 +2,7 @@
 #include "speedUp.h"
 #include <opencv2/opencv.hpp>
 #include <future>
+#include <omp.h>
 
 using namespace std;
 using namespace cv;
@@ -136,20 +137,14 @@ void ConvertFloat2Gray8U_SSE_test(float* Src, unsigned char* Dest, int Width, in
 
 static void ConvertFloat2Gray8U_async(float* Src, unsigned char* Dest, int Width, int Height, int Stride, int extWidth)
 {
-	const int32_t hw_concur = std::min(100, static_cast<int32_t>(std::thread::hardware_concurrency()));
-	std::vector<std::future<void>> fut(hw_concur);
-	const int thread_stride = (Height - 1) / hw_concur + 1;
-	int i = 0, start = 0;
-	for (; i < std::min(Height, hw_concur); i++, start += thread_stride)
+	const int thread_count = std::max(1, std::min(Height, omp_get_max_threads()));
+#pragma omp parallel num_threads(thread_count)
 	{
-		fut[i] = std::async(std::launch::async, [=]() {
-			ConvertFloat2Gray8U_SSE_test(Src, Dest, Width, Height, Stride, extWidth, start, thread_stride);
-			});
-	}
-	for (int j = 0; j < i; ++j)
-	{
-		if (fut[j].valid())
-			fut[j].wait();
+		const int tid = omp_get_thread_num();
+		const int start = Height * tid / thread_count;
+		const int end = Height * (tid + 1) / thread_count;
+		ConvertFloat2Gray8U_SSE_test(
+			Src, Dest, Width, Height, Stride, extWidth, start, end - start);
 	}
 }
 
@@ -188,25 +183,13 @@ void ConvertBGR8U2BGRAF_SSE(unsigned char* Src, float* Dest, int Width, int Heig
 typedef void (*ProcessFunc)(float*, int, int, float, float, float, float, int, int);
 void GaussBlur_asyncProcess(float* Data, int Width, int Height, float B0, float B1, float B2, float B3, int strideAll, ProcessFunc func)   // 新增参数
 {
-	const int32_t hw_concur = std::min(100/*Height >> 4*/, static_cast<int32_t>(std::thread::hardware_concurrency()));
-
-	std::vector<std::future<void>> fut(hw_concur);
-
-	const int thread_stride = (strideAll - 1) / hw_concur + 1;
-	int i = 0, start = 0;
-
-	for (; i < std::min(strideAll, hw_concur); i++, start += thread_stride)
+	const int thread_count = std::max(1, std::min(strideAll, omp_get_max_threads()));
+#pragma omp parallel num_threads(thread_count)
 	{
-		fut[i] = std::async(std::launch::async, [=]() {
-			func(Data, Width, Height, B0, B1, B2, B3, start, thread_stride);
-			});
-	}
-	for (int j = 0; j < i; ++j)
-	{
-		if (fut[j].valid())
-		{
-			fut[j].wait();
-		}
+		const int tid = omp_get_thread_num();
+		const int start = strideAll * tid / thread_count;
+		const int end = strideAll * (tid + 1) / thread_count;
+		func(Data, Width, Height, B0, B1, B2, B3, start, end - start);
 	}
 }
 
@@ -1005,33 +988,36 @@ void GaussBlur_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Heigh
 
 static void ConvertGray8U2Float_async(unsigned char* Src, float* Dest, int Width, int Height, int Stride, int DstRowStride, int DstColOffset)
 {
-	const int32_t hw_concur = std::min(100, static_cast<int32_t>(std::thread::hardware_concurrency()));
-	std::vector<std::future<void>> fut(hw_concur);
-	const int thread_stride = (Height - 1) / hw_concur + 1;
-	int i = 0, start = 0;
-	for (; i < std::min(Height, hw_concur); i++, start += thread_stride)
+	const int thread_count = std::max(1, std::min(Height, omp_get_max_threads()));
+#pragma omp parallel num_threads(thread_count)
 	{
-		fut[i] = std::async(std::launch::async, [=]() {
-			ConvertGray8U2Float_SSE_test(Src, Dest, Width, Height, Stride, DstRowStride, DstColOffset, start, thread_stride);
-			});
-	}
-	for (int j = 0; j < i; ++j)
-	{
-		if (fut[j].valid())
-			fut[j].wait();
+		const int tid = omp_get_thread_num();
+		const int start = Height * tid / thread_count;
+		const int end = Height * (tid + 1) / thread_count;
+		ConvertGray8U2Float_SSE_test(
+			Src, Dest, Width, Height, Stride, DstRowStride,
+			DstColOffset, start, end - start);
 	}
 }
 
 void GaussBlurGray_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float Radius)
+{
+	GaussBlurGray_SSE(Src, Dest, Width, Height, Stride, Radius, nullptr);
+}
+
+void GaussBlurGray_SSE(unsigned char* Src, unsigned char* Dest, int Width, int Height, int Stride, float Radius, float* WorkspaceBuffer)
 {
 	const int PAD = (int)(3 * Radius);
 	float B0, B1, B2, B3;
 	CalcGaussCof(Radius, B0, B1, B2, B3);
 	int extWidth = Width + 2 * PAD;
 	int extHeight = Height + 2 * PAD;
-	float* Buffer = (float*)_mm_malloc(extWidth * extHeight * sizeof(float), 16);
+	const bool owns_buffer = WorkspaceBuffer == nullptr;
+	float* Buffer = owns_buffer
+		? (float*)_mm_malloc(extWidth * extHeight * sizeof(float), 16)
+		: WorkspaceBuffer;
 	if (!Buffer)
-		return;
+		CV_Error(cv::Error::StsNoMem, "GaussBlurGray_SSE buffer allocation failed");
 	ConvertGray8U2Float_async(Src, Buffer + PAD * extWidth, Width, Height, Stride, extWidth, PAD);
 	// replicate left/right borders
 	for (int y = 0; y < extHeight; y++)
@@ -1057,7 +1043,8 @@ void GaussBlurGray_SSE(unsigned char* Src, unsigned char* Dest, int Width, int H
 	GaussBlur_asyncProcess(Buffer, extWidth, extHeight, B0, B1, B2, B3, extWidth, GaussBlurGrayFromTopToBottom_test);
 	GaussBlur_asyncProcess(Buffer, extWidth, extHeight, B0, B1, B2, B3, extWidth, GaussBlurGrayFromBottomToTop_test);
 	ConvertFloat2Gray8U_async(Buffer + PAD * extWidth + PAD, Dest, Width, Height, Stride, extWidth);
-	_mm_free(Buffer);
+	if (owns_buffer)
+		_mm_free(Buffer);
 }
 
 void ConvertGray8U2Float_SSE_test(unsigned char* Src, float* Dest, int Width, int Height, int Stride, int DstRowStride, int DstColOffset, int start_row, int thread_stride)
