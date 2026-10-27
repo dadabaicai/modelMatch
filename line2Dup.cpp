@@ -1,6 +1,8 @@
 ﻿#include "line2Dup.h"
 #include <iostream>
 #include <memory>
+#include <cmath>
+#include <limits>
 #include "speedUp.h"
 #include <pmmintrin.h>
 #include <chrono>
@@ -92,11 +94,16 @@ void Feature::read(const FileNode &fn)
 {
     FileNodeIterator fni = fn.begin();
     fni >> x >> y >> label;
+    // Older yaml only stored x/y/label; theta defaults to 0 after load.
+    if (fni != fn.end())
+        fni >> theta;
+    else
+        theta = 0.0f;
 }
 
 void Feature::write(FileStorage &fs) const
 {
-    fs << "[:" << x << y << label << "]";
+    fs << "[:" << x << y << label << theta << "]";
 }
 
 void Template::read(const FileNode &fn)
@@ -2404,6 +2411,458 @@ std::vector<Match> Detector::match(Mat source, float threshold,
     return matches;
 }
 
+std::vector<Match> Detector::clusterMatchesByPosition(const std::vector<Match> &matches,
+                                                      int max_dist_px)
+{
+    std::vector<Match> sorted = matches;
+    std::sort(sorted.begin(), sorted.end());
+
+    const int max_dist_sq = max_dist_px * max_dist_px;
+    std::vector<char> suppressed(sorted.size(), 0);
+    std::vector<Match> kept;
+    kept.reserve(sorted.size());
+
+    for (size_t i = 0; i < sorted.size(); ++i)
+    {
+        if (suppressed[i])
+            continue;
+        kept.push_back(sorted[i]);
+        for (size_t j = i + 1; j < sorted.size(); ++j)
+        {
+            if (suppressed[j])
+                continue;
+            if (sorted[i].class_id != sorted[j].class_id)
+                continue;
+            const int dx = sorted[i].x - sorted[j].x;
+            const int dy = sorted[i].y - sorted[j].y;
+            if (dx * dx + dy * dy <= max_dist_sq)
+                suppressed[j] = 1;
+        }
+    }
+    return kept;
+}
+
+static cv::Point2f rotate2d(const cv::Point2f inPoint, const double angRad);
+static cv::Point2f rotatePoint(const cv::Point2f inPoint, const cv::Point2f center, const double angRad);
+
+static std::vector<Template> makeRotatedTemplatePyramid(
+    const std::vector<Template> &to_rotate_tp, float theta, cv::Point2f center,
+    bool keep_template_origin)
+{
+    std::vector<Template> tp;
+    tp.resize(to_rotate_tp.size());
+    cv::Point2f c = center;
+
+    for (int l = 0; l < (int)to_rotate_tp.size(); ++l)
+    {
+        if (l > 0)
+            c *= 0.5f;
+
+        const int src_tl_x = to_rotate_tp[l].tl_x;
+        const int src_tl_y = to_rotate_tp[l].tl_y;
+        // Angle refine must keep the same template origin as the coarse match.
+        // Re-running cropTemplates() shifts tl_x/tl_y, while match.x/y still refer
+        // to the old origin, which misaligns features and collapses the score.
+        if (keep_template_origin)
+        {
+            tp[l].tl_x = src_tl_x;
+            tp[l].tl_y = src_tl_y;
+            tp[l].width = to_rotate_tp[l].width;
+            tp[l].height = to_rotate_tp[l].height;
+        }
+
+        for (const auto &f : to_rotate_tp[l].features)
+        {
+            Point2f p(f.x + src_tl_x, f.y + src_tl_y);
+            Point2f p_rot = rotatePoint(p, c, -theta / 180.0 * CV_PI);
+
+            Feature f_new;
+            if (keep_template_origin)
+            {
+                f_new.x = int(p_rot.x + 0.5f) - src_tl_x;
+                f_new.y = int(p_rot.y + 0.5f) - src_tl_y;
+            }
+            else
+            {
+                f_new.x = int(p_rot.x + 0.5f);
+                f_new.y = int(p_rot.y + 0.5f);
+            }
+            // Matching uses label only. Feature.theta is often 0 after readClasses()
+            // (older yaml omitted it). Recomputing label from a zero theta would
+            // force every feature into the same orientation bin and collapse the
+            // score. Recover an approximate orientation from label when needed.
+            // label = round(theta * 16/360) & 7  =>  bin width 22.5deg.
+            const float src_theta =
+                (f.theta != 0.0f) ? f.theta : (f.label * 22.5f);
+            f_new.theta = src_theta - theta;
+            while (f_new.theta > 360)
+                f_new.theta -= 360;
+            while (f_new.theta < 0)
+                f_new.theta += 360;
+            f_new.label = int(f_new.theta * 16 / 360 + 0.5f);
+            f_new.label &= 7;
+            tp[l].features.push_back(f_new);
+        }
+        tp[l].pyramid_level = l;
+    }
+
+    if (!keep_template_origin)
+        cropTemplates(tp);
+    return tp;
+}
+
+// Continuous metrics for sub-degree angle refine. LINE-MOD similarity saturates at
+// 100% (each feature contributes at most 4), so many nearby angles share the same
+// discrete score; edge magnitude + orientation residual still vary smoothly.
+static float featureThetaDeg(const Feature &f)
+{
+    return (f.theta != 0.0f) ? f.theta : (f.label * 22.5f);
+}
+
+static float circularAbsDiffDeg(float a, float b)
+{
+    float d = std::fmod(a - b, 360.0f);
+    if (d < 0.0f)
+        d += 360.0f;
+    if (d > 180.0f)
+        d = 360.0f - d;
+    return d;
+}
+
+static void sampleGradBilinear(const Mat &mag, const Mat &angle_deg, float x, float y,
+                               float &out_mag, float &out_angle)
+{
+    const int w = mag.cols;
+    const int h = mag.rows;
+    if (x < 0.0f || y < 0.0f || x >= w - 1.0f || y >= h - 1.0f)
+    {
+        const int xi = std::min(std::max(0, (int)std::floor(x + 0.5f)), w - 1);
+        const int yi = std::min(std::max(0, (int)std::floor(y + 0.5f)), h - 1);
+        out_mag = mag.at<float>(yi, xi);
+        out_angle = angle_deg.at<float>(yi, xi);
+        return;
+    }
+    const int x0 = (int)std::floor(x);
+    const int y0 = (int)std::floor(y);
+    const float dx = x - x0;
+    const float dy = y - y0;
+    const float m00 = mag.at<float>(y0, x0);
+    const float m10 = mag.at<float>(y0, x0 + 1);
+    const float m01 = mag.at<float>(y0 + 1, x0);
+    const float m11 = mag.at<float>(y0 + 1, x0 + 1);
+    out_mag = (1 - dx) * (1 - dy) * m00 + dx * (1 - dy) * m10 + (1 - dx) * dy * m01 +
+              dx * dy * m11;
+
+    // Interpolate orientation via unit vectors to avoid 360deg wrap artifacts.
+    auto unit = [](float deg, float &cx, float &sx) {
+        const float rad = deg * (float)CV_PI / 180.0f;
+        cx = std::cos(rad);
+        sx = std::sin(rad);
+    };
+    float c00, s00, c10, s10, c01, s01, c11, s11;
+    unit(angle_deg.at<float>(y0, x0), c00, s00);
+    unit(angle_deg.at<float>(y0, x0 + 1), c10, s10);
+    unit(angle_deg.at<float>(y0 + 1, x0), c01, s01);
+    unit(angle_deg.at<float>(y0 + 1, x0 + 1), c11, s11);
+    const float cx = (1 - dx) * (1 - dy) * c00 + dx * (1 - dy) * c10 + (1 - dx) * dy * c01 +
+                     dx * dy * c11;
+    const float sx = (1 - dx) * (1 - dy) * s00 + dx * (1 - dy) * s10 + (1 - dx) * dy * s01 +
+                     dx * dy * s11;
+    float deg = std::atan2(sx, cx) * 180.0f / (float)CV_PI;
+    if (deg < 0.0f)
+        deg += 360.0f;
+    out_angle = deg;
+}
+
+// Higher is better. Combines edge strength and orientation agreement at float
+// feature positions (no integer rounding of the rotated contour).
+static float continuousAngleScore(const Template &base, float delta_deg, Point2f center,
+                                  int match_x, int match_y, const Mat &mag,
+                                  const Mat &angle_deg)
+{
+    if (base.features.empty())
+        return -1e30f;
+
+    const float ang_rad = -delta_deg / 180.0f * (float)CV_PI;
+    const float cos_a = std::cos(ang_rad);
+    const float sin_a = std::sin(ang_rad);
+    const int tl_x = base.tl_x;
+    const int tl_y = base.tl_y;
+
+    double mag_sum = 0.0;
+    double ori_sum = 0.0;
+    int count = 0;
+    for (const auto &f : base.features)
+    {
+        const float abs_x = (float)f.x + (float)tl_x;
+        const float abs_y = (float)f.y + (float)tl_y;
+        const float dx = abs_x - center.x;
+        const float dy = abs_y - center.y;
+        const float rot_abs_x = center.x + cos_a * dx - sin_a * dy;
+        const float rot_abs_y = center.y + sin_a * dx + cos_a * dy;
+        const float fx = rot_abs_x - (float)tl_x;
+        const float fy = rot_abs_y - (float)tl_y;
+        const float img_x = (float)match_x + fx;
+        const float img_y = (float)match_y + fy;
+
+        float m = 0.0f, img_ang = 0.0f;
+        sampleGradBilinear(mag, angle_deg, img_x, img_y, m, img_ang);
+
+        float feat_ang = featureThetaDeg(f) - delta_deg;
+        while (feat_ang >= 360.0f)
+            feat_ang -= 360.0f;
+        while (feat_ang < 0.0f)
+            feat_ang += 360.0f;
+
+        mag_sum += m;
+        ori_sum += circularAbsDiffDeg(img_ang, feat_ang);
+        ++count;
+    }
+    if (count == 0)
+        return -1e30f;
+    const double mean_mag = mag_sum / count;
+    const double mean_ori = ori_sum / count;
+    // Prefer strong edges; penalize orientation mismatch (degrees).
+    return (float)(mean_mag / (1.0 + mean_ori / 45.0));
+}
+
+static float parabolicPeak(float x0, float y0, float x1, float y1, float x2, float y2)
+{
+    // Peak of parabola through (x0,y0),(x1,y1),(x2,y2); assumes x1 mid, equal step.
+    const float denom = (y0 - 2.0f * y1 + y2);
+    if (std::abs(denom) < 1e-12f)
+        return x1;
+    const float step = x1 - x0;
+    const float delta = 0.5f * (y0 - y2) / denom;
+    if (delta < -1.0f || delta > 1.0f)
+        return x1;
+    return x1 + delta * step;
+}
+
+void Detector::refineMatchAngles(const Mat &source, std::vector<Match> &matches,
+                                 const std::vector<float> &template_angles,
+                                 Point2f rotate_center, float half_range,
+                                 float angle_step, const Mat &mask) const
+{
+    if (matches.empty())
+        return;
+    CV_Assert(half_range >= 0.0f);
+    CV_Assert(angle_step > 0.0f);
+
+    std::lock_guard<std::mutex> match_lock(match_mutex);
+
+    // Rebuild response maps when cache is empty or image size changed.
+    const bool need_rebuild =
+        match_sizes.empty() || match_sizes[0] != source.size() || match_lm_pyramid.empty();
+    if (need_rebuild)
+    {
+        std::vector<Ptr<ColorGradientPyramid>> quantizers;
+        CV_Assert(mask.empty() || mask.size() == source.size());
+        if (match_quantizer.empty())
+            match_quantizer = modality->processForMatch(source, mask);
+        else
+            match_quantizer->reset(source, mask, modality->weak_threshold,
+                                   modality->num_features, modality->strong_threshold, true);
+        quantizers.push_back(match_quantizer);
+
+        match_lm_pyramid.resize(pyramid_levels);
+        match_spread_quantized.resize(pyramid_levels);
+        match_response_maps.resize(pyramid_levels);
+        match_sizes.clear();
+        match_sizes.reserve(pyramid_levels);
+        for (int l = 0; l < pyramid_levels; ++l)
+        {
+            match_lm_pyramid[l].resize(1);
+            match_lm_pyramid[l][0].resize(8);
+            int T = T_at_level[l];
+            if (l > 0)
+            {
+                for (int i = 0; i < (int)quantizers.size(); ++i)
+                    quantizers[i]->pyrDown();
+            }
+            Mat quantized;
+            Mat &spread_quantized = match_spread_quantized[l];
+            std::vector<Mat> &response_maps = match_response_maps[l];
+            for (int i = 0; i < (int)quantizers.size(); ++i)
+            {
+                quantizers[i]->quantize(quantized);
+                spread_quantized.create(quantized.size(), CV_8UC1);
+                IM_Spread(quantized.ptr(), spread_quantized.ptr(), quantized.cols, quantized.rows,
+                          static_cast<const int>(quantized.step1()), T);
+                computeResponseMaps(spread_quantized, response_maps);
+                linearizeResponseMaps(response_maps, match_lm_pyramid[l][i], T);
+            }
+            match_sizes.push_back(quantized.size());
+        }
+    }
+
+    // Continuous gradient field for stage-2 angle scoring.
+    Mat gray;
+    if (source.channels() == 1)
+        gray = source;
+    else
+        cvtColor(source, gray, COLOR_BGR2GRAY);
+    Mat blurred, gx, gy, mag_f, angle_deg;
+    GaussianBlur(gray, blurred, Size(5, 5), 1.0, 0.0, BORDER_REPLICATE);
+    Sobel(blurred, gx, CV_32F, 1, 0, 3, 1.0, 0.0, BORDER_REPLICATE);
+    Sobel(blurred, gy, CV_32F, 0, 1, 3, 1.0, 0.0, BORDER_REPLICATE);
+    magnitude(gx, gy, mag_f);
+    phase(gx, gy, angle_deg, true);
+
+    const int T = T_at_level[0];
+    const Size size = match_sizes[0];
+    const std::vector<LinearMemories> &lms = match_lm_pyramid[0];
+    const int border = 8 * T;
+    const int offset = T / 2 + (T % 2 - 1);
+
+    for (auto &match : matches)
+    {
+        TemplatesMap::const_iterator it = class_templates.find(match.class_id);
+        if (it == class_templates.end())
+            continue;
+        if (match.template_id < 0 ||
+            match.template_id >= (int)it->second.size() ||
+            match.template_id >= (int)template_angles.size())
+            continue;
+
+        const TemplatePyramid &base_tp = it->second[match.template_id];
+        const float base_angle = template_angles[match.template_id];
+        if (match.angle == 0.0f)
+            match.angle = base_angle;
+
+        struct Cand
+        {
+            float angle;
+            float delta;
+            double raw;
+            float score;
+            int x, y;
+            float cont;
+        };
+        std::vector<Cand> cands;
+        cands.reserve((size_t)(2.0f * half_range / angle_step) + 4);
+
+        double best_raw = -1.0;
+
+        for (float delta = -half_range; delta <= half_range + 1e-4f; delta += angle_step)
+        {
+            const float candidate_angle = base_angle + delta;
+            TemplatePyramid tp =
+                (std::abs(delta) < 1e-6f)
+                    ? base_tp
+                    : makeRotatedTemplatePyramid(base_tp, delta, rotate_center, true);
+
+            const int max_x = size.width - tp[0].width - border;
+            const int max_y = size.height - tp[0].height - border;
+            int x = match.x;
+            int y = match.y;
+            x = std::max(x, border);
+            y = std::max(y, border);
+            if (max_x >= border)
+                x = std::min(x, max_x);
+            if (max_y >= border)
+                y = std::min(y, max_y);
+
+            const Template &templ = tp[0];
+            Mat similarities2;
+            if (templ.features.size() < 64)
+                similarityLocal_64(lms[0], templ, similarities2, size, T, Point(x, y));
+            else if (templ.features.size() < 8192)
+                similarityLocal(lms[0], templ, similarities2, size, T, Point(x, y));
+            else
+                continue;
+
+            double best_raw_score = 0.0;
+            Point best_position;
+            minMaxLoc(similarities2, nullptr, &best_raw_score, nullptr, &best_position);
+            const int numFeatures = static_cast<int>(templ.features.size());
+            if (numFeatures <= 0)
+                continue;
+            const float score =
+                static_cast<float>(best_raw_score * 100.0 / (4 * numFeatures));
+            const int refined_x = (x / T - 8 + best_position.x) * T + offset;
+            const int refined_y = (y / T - 8 + best_position.y) * T + offset;
+
+            const float cont = continuousAngleScore(base_tp[0], delta, rotate_center,
+                                                    refined_x, refined_y, mag_f, angle_deg);
+            cands.push_back({candidate_angle, delta, best_raw_score, score, refined_x,
+                             refined_y, cont});
+            if (best_raw_score > best_raw)
+                best_raw = best_raw_score;
+        }
+
+        if (cands.empty())
+            continue;
+
+        // Among discrete-score plateau (typical when many angles hit ~100%), pick by
+        // continuous metric. Allow 1 raw unit slack (~one feature slightly worse).
+        const double raw_tol = 1.0;
+        float best_cont = -1e30f;
+        size_t best_i = 0;
+        for (size_t i = 0; i < cands.size(); ++i)
+        {
+            if (cands[i].raw + 1e-6 < best_raw - raw_tol)
+                continue;
+            if (cands[i].cont > best_cont)
+            {
+                best_cont = cands[i].cont;
+                best_i = i;
+            }
+        }
+
+        // Finer continuous-only search around the plateau winner.
+        const float fine_half = angle_step;
+        const float fine_step = std::max(0.02f, angle_step * 0.2f);
+        const float center_delta = cands[best_i].delta;
+        const int fix_x = cands[best_i].x;
+        const int fix_y = cands[best_i].y;
+
+        float fine_best_delta = center_delta;
+        float fine_best_cont = best_cont;
+        float prev_delta = 0, prev_cont = 0, cur_delta = 0, cur_cont = 0;
+        float next_delta = 0, next_cont = 0;
+        bool have_triplet = false;
+        std::vector<std::pair<float, float>> fine_samples;
+        for (float d = center_delta - fine_half; d <= center_delta + fine_half + 1e-5f;
+             d += fine_step)
+        {
+            const float cont =
+                continuousAngleScore(base_tp[0], d, rotate_center, fix_x, fix_y, mag_f,
+                                     angle_deg);
+            fine_samples.emplace_back(d, cont);
+            if (cont > fine_best_cont)
+            {
+                fine_best_cont = cont;
+                fine_best_delta = d;
+            }
+        }
+        for (size_t i = 1; i + 1 < fine_samples.size(); ++i)
+        {
+            if (std::abs(fine_samples[i].first - fine_best_delta) < 1e-5f)
+            {
+                prev_delta = fine_samples[i - 1].first;
+                prev_cont = fine_samples[i - 1].second;
+                cur_delta = fine_samples[i].first;
+                cur_cont = fine_samples[i].second;
+                next_delta = fine_samples[i + 1].first;
+                next_cont = fine_samples[i + 1].second;
+                have_triplet = true;
+                break;
+            }
+        }
+        float refined_delta = fine_best_delta;
+        if (have_triplet)
+            refined_delta =
+                parabolicPeak(prev_delta, prev_cont, cur_delta, cur_cont, next_delta,
+                              next_cont);
+
+        match.similarity = cands[best_i].score;
+        match.angle = base_angle + refined_delta;
+        match.x = fix_x;
+        match.y = fix_y;
+    }
+}
+
 // Used to filter out weak matches
 struct MatchPredicate
 {
@@ -2666,10 +3125,6 @@ void Detector::matchClass(const LinearMemoryPyramid &lm_pyramid,
                 minMaxLoc(similarities2, nullptr, &best_raw_score, nullptr, &best_position);
                 const float best_score =
                     static_cast<float>(best_raw_score * 100.0 / (4 * numFeatures));
-                if (best_score >= 100)
-                {
-                    std::cout << "stop!/n";
-                }
                 const int best_r = best_position.y;
                 const int best_c = best_position.x;
                 // Update current match
@@ -2765,42 +3220,10 @@ int Detector::addTemplate_rotate(const string &class_id, int zero_id,
 {
     std::vector<TemplatePyramid> &template_pyramids = class_templates[class_id];
     int template_id = static_cast<int>(template_pyramids.size());
+    CV_Assert(zero_id >= 0 && zero_id < (int)template_pyramids.size());
 
-    const auto& to_rotate_tp = template_pyramids[zero_id];
-
-    TemplatePyramid tp;
-    tp.resize(pyramid_levels);
-
-    for (int l = 0; l < pyramid_levels; ++l)
-    {
-        if(l>0) center /= 2;
-
-        for(auto& f: to_rotate_tp[l].features){
-            Point2f p;
-            p.x = f.x + to_rotate_tp[l].tl_x;
-            p.y = f.y + to_rotate_tp[l].tl_y;
-            Point2f p_rot = rotatePoint(p, center, -theta/180*CV_PI);
-
-            Feature f_new;
-            f_new.x = int(p_rot.x + 0.5f);
-            f_new.y = int(p_rot.y + 0.5f);
-
-            f_new.theta = f.theta - theta;
-            while(f_new.theta > 360) f_new.theta -= 360;
-            while(f_new.theta < 0) f_new.theta += 360;
-
-            f_new.label = int(f_new.theta * 16 / 360 + 0.5f);
-            f_new.label &= 7;
-
-
-            tp[l].features.push_back(f_new);
-        }
-        tp[l].pyramid_level = l;
-    }
-
-    cropTemplates(tp);
-
-    template_pyramids.push_back(tp);
+    template_pyramids.push_back(
+        makeRotatedTemplatePyramid(template_pyramids[zero_id], theta, center, false));
     return template_id;
 }
 const std::vector<Template> &Detector::getTemplates(const std::string &class_id, int template_id) const

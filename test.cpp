@@ -256,7 +256,8 @@ void angle_test(string mode = "test", bool use_rot = true){
 
         shape_based_matching::shapeInfo_producer shapes(padded_img, padded_mask);
         shapes.angle_range = {-10, 10};
-        shapes.angle_step = 0.1;
+        // Coarse angle library (scheme A). Fine 0.1deg search runs at match time.
+        shapes.angle_step = 1.0;
 
         shapes.scale_range = {1}; // support just one
         shapes.produce_infos();
@@ -344,6 +345,26 @@ void angle_test(string mode = "test", bool use_rot = true){
         Timer timer;
         auto matches = detector.match(img, 90, ids);
         timer.out("match end");
+
+        // B: one match per spatial cluster
+        matches = line2Dup::Detector::clusterMatchesByPosition(matches, 16);
+        std::cout << "matches after cluster: " << matches.size() << std::endl;
+
+        // A: local fine-angle refine around each coarse template (±1deg, 0.1deg step)
+        std::vector<float> template_angles(infos.size());
+        for (size_t i = 0; i < infos.size(); ++i)
+            template_angles[i] = infos[i].angle;
+        for (auto &m : matches)
+        {
+            if (m.template_id >= 0 && m.template_id < (int)infos.size())
+                m.angle = infos[m.template_id].angle;
+        }
+        const float train_img_half_width = 520 / 2.0f + 100;
+        const float train_img_half_height = 520 / 2.0f + 100;
+        detector.refineMatchAngles(img, matches, template_angles,
+                                   {train_img_half_width, train_img_half_height},
+                                   1.0f, 0.1f);
+        timer.out("angle refine");
 		
         auto end = std::chrono::high_resolution_clock::now();
 		// 以毫秒为单位计算时间差
@@ -367,11 +388,6 @@ void angle_test(string mode = "test", bool use_rot = true){
 
             float r_scaled = 520/2.0f*infos[match.template_id].scale;
 
-            // scaling won't affect this, because it has been determined by warpAffine
-            // cv::warpAffine(src, dst, rot_mat, src.size()); last param
-            float train_img_half_width = 520 /2.0f + 100;
-            float train_img_half_height = 520 /2.0f + 100;
-
             // center x,y of train_img in test img
             float x =  match.x - templ[0].tl_x + train_img_half_width;
             float y =  match.y - templ[0].tl_y + train_img_half_height;
@@ -388,7 +404,7 @@ void angle_test(string mode = "test", bool use_rot = true){
             cv::putText(img, to_string(int(round(match.similarity))),
                         Point(match.x+r_scaled-10, match.y-3), FONT_HERSHEY_PLAIN, 2, randColor);
 
-            cv::RotatedRect rotatedRectangle({x, y}, {2*r_scaled, 2*r_scaled}, -infos[match.template_id].angle);
+            cv::RotatedRect rotatedRectangle({x, y}, {2*r_scaled, 2*r_scaled}, -match.angle);
 
             cv::Point2f vertices[4];
             rotatedRectangle.points(vertices);
@@ -399,6 +415,8 @@ void angle_test(string mode = "test", bool use_rot = true){
 
             std::cout << "\nmatch.template_id: " << match.template_id << std::endl;
             std::cout << "match.similarity: " << match.similarity << std::endl;
+            std::cout << "coarse angle: " << infos[match.template_id].angle
+                      << ", refined angle: " << match.angle << std::endl;
         }
         cv::namedWindow("img", WINDOW_NORMAL);
         imshow("img", img);

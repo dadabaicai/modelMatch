@@ -140,11 +140,10 @@ public:
 
 struct Match
 {
-    Match()
-    {
-    }
+    Match() : x(0), y(0), similarity(0), template_id(0), angle(0) {}
 
-    Match(int x, int y, float similarity, const std::string &class_id, int template_id);
+    Match(int x, int y, float similarity, const std::string &class_id, int template_id,
+                float angle = 0.0f);
 
     /// Sort matches with high similarity to the front
     bool operator<(const Match &rhs) const
@@ -166,10 +165,13 @@ struct Match
     float similarity;
     std::string class_id;
     int template_id;
+    /// Training / refined pose angle in degrees. Filled by the caller or refineMatchAngles().
+    float angle;
 };
 
-inline Match::Match(int _x, int _y, float _similarity, const std::string &_class_id, int _template_id)
-        : x(_x), y(_y), similarity(_similarity), class_id(_class_id), template_id(_template_id)
+inline Match::Match(int _x, int _y, float _similarity, const std::string &_class_id, int _template_id,
+                                        float _angle)
+        : x(_x), y(_y), similarity(_similarity), class_id(_class_id), template_id(_template_id), angle(_angle)
 {
 }
 
@@ -187,6 +189,25 @@ public:
     std::vector<Match> match(cv::Mat sources, float threshold,
                                                      const std::vector<std::string> &class_ids = std::vector<std::string>(),
                                                      const cv::Mat masks = cv::Mat()) const;
+
+    /// Keep the highest-score match in each spatial neighborhood (same class_id).
+    static std::vector<Match> clusterMatchesByPosition(const std::vector<Match> &matches,
+                                                                                                         int max_dist_px);
+
+    /**
+         * Local fine-angle search around each match.
+         * Stage 1: LINE-MOD discrete score (same as match).
+         * Stage 2: when scores saturate near 100%, continuous edge magnitude +
+         *          orientation residual pick the angle; parabolic sub-step fit.
+         * Reuses response maps from the previous match() on the same image when possible.
+         * template_angles[template_id] is the coarse training angle in degrees.
+         * Updates match.angle / similarity / x / y in place.
+         */
+    void refineMatchAngles(const cv::Mat &source, std::vector<Match> &matches,
+                                                 const std::vector<float> &template_angles,
+                                                 cv::Point2f rotate_center,
+                                                 float half_range = 1.0f, float angle_step = 0.1f,
+                                                 const cv::Mat &mask = cv::Mat()) const;
 
     int addTemplate(const cv::Mat sources, const std::string &class_id,
                                     const cv::Mat &object_mask, int num_features = 0);
